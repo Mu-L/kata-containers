@@ -22,16 +22,13 @@ jobs:
       fail-fast: false
       matrix:
         containerd_version: ['active']
-        vmm: ['qemu']
-    runs-on: s390x
+        vmm: ['qemu', 'qemu-runtime-rs']
+    runs-on: s390x-large
     env:
       CONTAINERD_VERSION: ${{ matrix.containerd_version }}
       GOPATH: ${{ github.workspace }}
       KATA_HYPERVISOR: ${{ matrix.vmm }}
     steps:
-      - name: Take a pre-action for self-hosted runner
-        run: ${HOME}/script/pre_action.sh ubuntu-2204
-
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.commit-hash }}
@@ -47,7 +44,7 @@ jobs:
         run: bash tests/integration/cri-containerd/gha-run.sh install-dependencies
 
       - name: get-kata-tarball
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: kata-static-tarball-s390x${{ inputs.tarball-suffix }}
           path: kata-artifacts
@@ -57,7 +54,3 @@ jobs:
 
       - name: Run cri-containerd tests
         run: bash tests/integration/cri-containerd/gha-run.sh run
-
-      - name: Take a post-action for self-hosted runner
-        if: always()
-        run: ${HOME}/script/post_action.sh ubuntu-2204

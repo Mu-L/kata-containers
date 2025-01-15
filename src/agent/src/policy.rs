@@ -5,20 +5,13 @@
 
 use anyhow::{bail, Result};
 use protobuf::MessageDyn;
-use serde::{Deserialize, Serialize};
-use slog::Drain;
 use tokio::io::AsyncWriteExt;
-use tokio::time::{sleep, Duration};
 
 use crate::rpc::ttrpc_error;
-use crate::AGENT_POLICY;
-
-static EMPTY_JSON_INPUT: &str = "{\"input\":{}}";
-
-static OPA_DATA_PATH: &str = "/data";
-static OPA_POLICIES_PATH: &str = "/policies";
+use crate::{AGENT_CONFIG, AGENT_POLICY};
 
 static POLICY_LOG_FILE: &str = "/tmp/policy.txt";
+static POLICY_DEFAULT_FILE: &str = "/etc/kata-opa/default-policy.rego";
 
 /// Convenience macro to obtain the scope logger
 macro_rules! sl {
@@ -28,14 +21,21 @@ macro_rules! sl {
 }
 
 async fn allow_request(policy: &mut AgentPolicy, ep: &str, request: &str) -> ttrpc::Result<()> {
-    if !policy.allow_request(ep, request).await {
-        warn!(sl!(), "{ep} is blocked by policy");
-        Err(ttrpc_error(
-            ttrpc::Code::PERMISSION_DENIED,
-            format!("{ep} is blocked by policy"),
-        ))
-    } else {
-        Ok(())
+    match policy.allow_request(ep, request).await {
+        Ok((allowed, prints)) => {
+            if allowed {
+                Ok(())
+            } else {
+                Err(ttrpc_error(
+                    ttrpc::Code::PERMISSION_DENIED,
+                    format!("{ep} is blocked by policy: {prints}"),
+                ))
+            }
+        }
+        Err(e) => Err(ttrpc_error(
+            ttrpc::Code::INTERNAL,
+            format!("{ep}: internal error {e}"),
+        )),
     }
 }
 
@@ -55,32 +55,23 @@ pub async fn do_set_policy(req: &protocols::agent::SetPolicyRequest) -> ttrpc::R
         .map_err(|e| ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, e))
 }
 
-/// Example of HTTP response from OPA: {"result":true}
-#[derive(Debug, Serialize, Deserialize)]
-struct AllowResponse {
-    result: bool,
-}
-
 /// Singleton policy object.
 #[derive(Debug, Default)]
 pub struct AgentPolicy {
     /// When true policy errors are ignored, for debug purposes.
     allow_failures: bool,
 
-    /// OPA path used to query if an Agent gRPC request should be allowed.
-    /// The request name (e.g., CreateContainerRequest) must be added to
-    /// this path.
-    query_path: String,
-
-    /// OPA path used to add or delete a rego format Policy.
-    policy_path: String,
-
-    /// Client used to connect a single time to the OPA service and reused
-    /// for all the future communication with OPA.
-    opa_client: Option<reqwest::Client>,
-
     /// "/tmp/policy.txt" log file for policy activity.
     log_file: Option<tokio::fs::File>,
+
+    /// Regorus engine
+    engine: regorus::Engine,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct MetadataResponse {
+    allowed: bool,
+    ops: Option<json_patch::Patch>,
 }
 
 impl AgentPolicy {
@@ -88,19 +79,32 @@ impl AgentPolicy {
     pub fn new() -> Self {
         Self {
             allow_failures: false,
+            engine: Self::new_engine(),
             ..Default::default()
         }
     }
 
-    /// Wait for OPA to start and connect to it.
-    pub async fn initialize(
-        &mut self,
-        launch_opa: bool,
-        opa_addr: &str,
-        policy_name: &str,
-        default_policy: &str,
-    ) -> Result<()> {
-        if sl!().is_enabled(slog::Level::Debug) {
+    fn new_engine() -> regorus::Engine {
+        let mut engine = regorus::Engine::new();
+        engine.set_strict_builtin_errors(false);
+        engine.set_gather_prints(true);
+        // assign a slice of the engine data "pstate" to be used as policy state
+        engine
+            .add_data(
+                regorus::Value::from_json_str(
+                    r#"{
+                        "pstate": {}
+                    }"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        engine
+    }
+
+    /// Initialize regorus.
+    pub async fn initialize(&mut self) -> Result<()> {
+        if AGENT_CONFIG.log_level.as_usize() >= slog::Level::Debug.as_usize() {
             self.log_file = Some(
                 tokio::fs::OpenOptions::new()
                     .write(true)
@@ -112,147 +116,115 @@ impl AgentPolicy {
             debug!(sl!(), "policy: log file: {}", POLICY_LOG_FILE);
         }
 
-        if launch_opa {
-            start_opa(opa_addr)?;
+        // Check if policy file has been set via AgentConfig
+        // If empty, use default file.
+        let mut default_policy_file = AGENT_CONFIG.policy_file.clone();
+        if default_policy_file.is_empty() {
+            default_policy_file = POLICY_DEFAULT_FILE.to_string();
         }
+        info!(sl!(), "default policy: {default_policy_file}");
 
-        let opa_uri = format!("http://{opa_addr}/v1");
-        self.query_path = format!("{opa_uri}{OPA_DATA_PATH}{policy_name}/");
-        self.policy_path = format!("{opa_uri}{OPA_POLICIES_PATH}{policy_name}");
-        let opa_client = reqwest::Client::builder().http1_only().build()?;
-        let policy = tokio::fs::read_to_string(default_policy).await?;
-
-        // This loop is necessary to get the opa_client connected to the
-        // OPA service while that service is starting. Future requests to
-        // OPA are expected to work without retrying, after connecting
-        // successfully for the first time.
-        for i in 0..50 {
-            if i > 0 {
-                sleep(Duration::from_millis(100)).await;
-                debug!(sl!(), "policy initialize: PUT failed, retrying");
-            }
-
-            // Set-up the default policy.
-            if opa_client
-                .put(&self.policy_path)
-                .body(policy.clone())
-                .send()
-                .await
-                .is_ok()
-            {
-                self.opa_client = Some(opa_client);
-
-                // Check if requests causing policy errors should actually
-                // be allowed. That is an insecure configuration but is
-                // useful for allowing insecure pods to start, then connect to
-                // them and inspect Guest logs for the root cause of a failure.
-                //
-                // Note that post_query returns Ok(false) in case
-                // AllowRequestsFailingPolicy was not defined in the policy.
-                self.allow_failures = self
-                    .post_query("AllowRequestsFailingPolicy", EMPTY_JSON_INPUT)
-                    .await?;
-                return Ok(());
-            }
-        }
-        bail!("Failed to connect to OPA")
+        self.engine.add_policy_from_file(default_policy_file)?;
+        self.update_allow_failures_flag().await?;
+        Ok(())
     }
 
-    /// Ask OPA to check if an API call should be allowed or not.
-    pub async fn allow_request(&mut self, ep: &str, request: &str) -> bool {
-        let post_input = format!("{{\"input\":{request}}}");
-        self.log_opa_input(ep, &post_input).await;
-        match self.post_query(ep, &post_input).await {
-            Err(e) => {
-                debug!(
-                    sl!(),
-                    "policy: failed to query endpoint {}: {:?}. Returning false.", ep, e
-                );
-                false
-            }
-            Ok(allowed) => allowed,
-        }
+    async fn apply_patch_to_state(&mut self, patch: json_patch::Patch) -> Result<()> {
+        // Convert the current engine data to a JSON value
+        let mut state = serde_json::to_value(self.engine.get_data())?;
+
+        // Apply the patch to the state
+        json_patch::patch(&mut state, &patch)?;
+
+        // Clear the existing data in the engine
+        self.engine.clear_data();
+
+        // Add the patched state back to the engine
+        self.engine
+            .add_data(regorus::Value::from_json_str(&state.to_string())?)?;
+
+        Ok(())
     }
 
-    /// Replace the Policy in OPA.
-    pub async fn set_policy(&mut self, policy: &str) -> Result<()> {
-        if let Some(opa_client) = &mut self.opa_client {
-            // Delete the old rules.
-            opa_client.delete(&self.policy_path).send().await?;
-
-            // Put the new rules.
-            opa_client
-                .put(&self.policy_path)
-                .body(policy.to_string())
-                .send()
-                .await?;
-
-            // Check if requests causing policy errors should actually be allowed.
-            // That is an insecure configuration but is useful for allowing insecure
-            // pods to start, then connect to them and inspect Guest logs for the
-            // root cause of a failure.
-            //
-            // Note that post_query returns Ok(false) in case
-            // AllowRequestsFailingPolicy was not defined in the policy.
-            self.allow_failures = self
-                .post_query("AllowRequestsFailingPolicy", EMPTY_JSON_INPUT)
-                .await?;
-
-            Ok(())
-        } else {
-            bail!("Agent Policy is not initialized")
-        }
-    }
-
-    // Post query to OPA.
-    async fn post_query(&mut self, ep: &str, post_input: &str) -> Result<bool> {
+    /// Ask regorus if an API call should be allowed or not.
+    async fn allow_request(&mut self, ep: &str, ep_input: &str) -> Result<(bool, String)> {
         debug!(sl!(), "policy check: {ep}");
+        self.log_eval_input(ep, ep_input).await;
 
-        if let Some(opa_client) = &mut self.opa_client {
-            let uri = format!("{}{ep}", &self.query_path);
-            let response = opa_client
-                .post(uri)
-                .body(post_input.to_string())
-                .send()
-                .await?;
+        let query = format!("data.agent_policy.{ep}");
+        self.engine.set_input_json(ep_input)?;
 
-            if response.status() != http::StatusCode::OK {
-                bail!("policy: POST {} response status {}", ep, response.status());
+        let results = self.engine.eval_query(query, false)?;
+
+        let prints = match self.engine.take_prints() {
+            Ok(p) => p.join(" "),
+            Err(e) => format!("Failed to get policy log: {e}"),
+        };
+
+        if results.result.len() != 1 {
+            // Results are empty when AllowRequestsFailingPolicy is used to allow a Request that hasn't been defined in the policy
+            if self.allow_failures {
+                return Ok((true, prints));
             }
-
-            let http_response = response.text().await?;
-            let opa_response: serde_json::Result<AllowResponse> =
-                serde_json::from_str(&http_response);
-
-            match opa_response {
-                Ok(resp) => {
-                    if !resp.result {
-                        if self.allow_failures {
-                            warn!(
-                                sl!(),
-                                "policy: POST {} response <{}>. Ignoring error!", ep, http_response
-                            );
-                            return Ok(true);
-                        } else {
-                            error!(sl!(), "policy: POST {} response <{}>", ep, http_response);
-                        }
-                    }
-                    Ok(resp.result)
-                }
-                Err(_) => {
-                    warn!(
-                        sl!(),
-                        "policy: endpoint {} not found in policy. Returning false.", ep,
-                    );
-                    Ok(false)
-                }
-            }
-        } else {
-            bail!("Agent Policy is not initialized")
+            bail!(
+                "policy check: unexpected eval_query result len {:?}",
+                results
+            );
         }
+
+        if results.result[0].expressions.len() != 1 {
+            bail!(
+                "policy check: unexpected eval_query result expressions {:?}",
+                results
+            );
+        }
+
+        let mut allow = match &results.result[0].expressions[0].value {
+            regorus::Value::Bool(b) => *b,
+
+            // Match against a specific variant that could be interpreted as MetadataResponse
+            regorus::Value::Object(obj) => {
+                let json_str = serde_json::to_string(obj)?;
+
+                self.log_eval_input(ep, &json_str).await;
+
+                let metadata_response: MetadataResponse = serde_json::from_str(&json_str)?;
+
+                if metadata_response.allowed {
+                    if let Some(ops) = metadata_response.ops {
+                        self.apply_patch_to_state(ops).await?;
+                    }
+                }
+                metadata_response.allowed
+            }
+
+            _ => {
+                error!(sl!(), "allow_request: unexpected eval_query result type");
+                bail!(
+                    "policy check: unexpected eval_query result type {:?}",
+                    results
+                );
+            }
+        };
+
+        if !allow && self.allow_failures {
+            warn!(sl!(), "policy: ignoring error for {ep}");
+            allow = true;
+        }
+
+        Ok((allow, prints))
     }
 
-    async fn log_opa_input(&mut self, ep: &str, input: &str) {
+    /// Replace the Policy in regorus.
+    pub async fn set_policy(&mut self, policy: &str) -> Result<()> {
+        self.engine = Self::new_engine();
+        self.engine
+            .add_policy("agent_policy".to_string(), policy.to_string())?;
+        self.update_allow_failures_flag().await?;
+        Ok(())
+    }
+
+    async fn log_eval_input(&mut self, ep: &str, input: &str) {
         if let Some(log_file) = &mut self.log_file {
             match ep {
                 "StatsContainerRequest" | "ReadStreamRequest" | "SetPolicyRequest" => {
@@ -267,33 +239,28 @@ impl AgentPolicy {
                     let log_entry = format!("[\"ep\":\"{ep}\",{input}],\n\n");
 
                     if let Err(e) = log_file.write_all(log_entry.as_bytes()).await {
-                        warn!(sl!(), "policy: log_opa_input: write_all failed: {}", e);
+                        warn!(sl!(), "policy: log_eval_input: write_all failed: {}", e);
                     } else if let Err(e) = log_file.flush().await {
-                        warn!(sl!(), "policy: log_opa_input: flush failed: {}", e);
+                        warn!(sl!(), "policy: log_eval_input: flush failed: {}", e);
                     }
                 }
             }
         }
     }
-}
 
-fn start_opa(opa_addr: &str) -> Result<()> {
-    let bin_dirs = vec!["/bin", "/usr/bin", "/usr/local/bin"];
-    for bin_dir in &bin_dirs {
-        let opa_path = bin_dir.to_string() + "/opa";
-        if std::fs::metadata(&opa_path).is_ok() {
-            // args copied from kata-opa.service.in.
-            std::process::Command::new(&opa_path)
-                .arg("run")
-                .arg("--server")
-                .arg("--disable-telemetry")
-                .arg("--addr")
-                .arg(opa_addr)
-                .arg("--log-level")
-                .arg("info")
-                .spawn()?;
-            return Ok(());
-        }
+    async fn update_allow_failures_flag(&mut self) -> Result<()> {
+        self.allow_failures = match self.allow_request("AllowRequestsFailingPolicy", "{}").await {
+            Ok((allowed, _prints)) => {
+                if allowed {
+                    warn!(
+                        sl!(),
+                        "policy: AllowRequestsFailingPolicy is enabled - will ignore errors"
+                    );
+                }
+                allowed
+            }
+            Err(_) => false,
+        };
+        Ok(())
     }
-    bail!("OPA binary not found in {:?}", &bin_dirs);
 }

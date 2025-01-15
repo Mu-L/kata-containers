@@ -23,13 +23,18 @@ jobs:
         container_engine:
           - crio
           - containerd
-        include:
+        # TODO: enable when https://github.com/kata-containers/kata-containers/issues/9853 is fixed
+        #include:
+        #  - container_engine: containerd
+        #    containerd_version: lts
+        exclude:
+          # TODO: enable with containerd when https://github.com/kata-containers/kata-containers/issues/9761 is fixed
           - container_engine: containerd
-            containerd_version: lts
-    runs-on: garm-ubuntu-2204-smaller
+            vmm: qemu
+    runs-on: ubuntu-22.04
     env:
       CONTAINER_ENGINE: ${{ matrix.container_engine }}
-      CONTAINERD_VERSION: ${{ matrix.containerd_version }}
+      #CONTAINERD_VERSION: ${{ matrix.containerd_version }}
       KATA_HYPERVISOR: ${{ matrix.vmm }}
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +52,7 @@ jobs:
         run: bash tests/functional/kata-monitor/gha-run.sh install-dependencies
 
       - name: get-kata-tarball
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
           path: kata-artifacts

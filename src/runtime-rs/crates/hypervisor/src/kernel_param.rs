@@ -7,8 +7,9 @@
 use anyhow::{anyhow, Result};
 
 use crate::{
-    VM_ROOTFS_DRIVER_BLK, VM_ROOTFS_DRIVER_MMIO, VM_ROOTFS_DRIVER_PMEM, VM_ROOTFS_FILESYSTEM_EROFS,
-    VM_ROOTFS_FILESYSTEM_EXT4, VM_ROOTFS_FILESYSTEM_XFS, VM_ROOTFS_ROOT_BLK, VM_ROOTFS_ROOT_PMEM,
+    VM_ROOTFS_DRIVER_BLK, VM_ROOTFS_DRIVER_BLK_CCW, VM_ROOTFS_DRIVER_MMIO, VM_ROOTFS_DRIVER_PMEM,
+    VM_ROOTFS_FILESYSTEM_EROFS, VM_ROOTFS_FILESYSTEM_EXT4, VM_ROOTFS_FILESYSTEM_XFS,
+    VM_ROOTFS_ROOT_BLK, VM_ROOTFS_ROOT_PMEM,
 };
 use kata_types::config::LOG_VPORT_OPTION;
 
@@ -89,7 +90,7 @@ impl KernelParams {
                     }
                 }
             }
-            VM_ROOTFS_DRIVER_BLK | VM_ROOTFS_DRIVER_MMIO => {
+            VM_ROOTFS_DRIVER_BLK | VM_ROOTFS_DRIVER_BLK_CCW | VM_ROOTFS_DRIVER_MMIO => {
                 params.push(Param::new("root", VM_ROOTFS_ROOT_BLK));
                 match rootfs_type {
                     VM_ROOTFS_FILESYSTEM_EXT4 | VM_ROOTFS_FILESYSTEM_XFS => {
@@ -115,6 +116,11 @@ impl KernelParams {
 
     pub(crate) fn append(&mut self, params: &mut KernelParams) {
         self.params.append(&mut params.params);
+    }
+
+    #[cfg(not(target_arch = "s390x"))]
+    pub(crate) fn push(&mut self, new_param: Param) {
+        self.params.push(new_param);
     }
 
     pub(crate) fn from_string(params_string: &str) -> Self {

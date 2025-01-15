@@ -424,7 +424,7 @@ impl DeviceOpContext {
     fn generate_virtio_device_info(&self) -> Result<HashMap<(DeviceType, String), MMIODeviceInfo>> {
         let mut dev_info = HashMap::new();
         #[cfg(feature = "dbs-virtio-devices")]
-        for (_index, device) in self.virtio_devices.iter().enumerate() {
+        for device in self.virtio_devices.iter() {
             let (mmio_base, mmio_size, irq) = DeviceManager::get_virtio_mmio_device_info(device)?;
             let dev_type;
             let device_id;
@@ -553,7 +553,7 @@ impl DeviceOpContext {
         &self,
         dev: &Arc<dyn DeviceIo>,
         callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>>,
-    ) -> Result<()> {
+    ) -> Result<u8> {
         if !self.is_hotplug || !self.pci_hotplug_enabled {
             return Err(DeviceMgrError::InvalidOperation);
         }
@@ -561,7 +561,12 @@ impl DeviceOpContext {
         let (busno, devfn) = DeviceManager::get_pci_device_info(dev)?;
         let req = DevMgrRequest::AddPciDev(PciDevRequest { busno, devfn });
 
-        self.call_hotplug_device(req, callback)
+        self.call_hotplug_device(req, callback)?;
+
+        // Extract the slot number from devfn
+        // Right shift by 3 to remove function bits (2:0) and
+        // align slot bits (7:3) to the least significant position
+        Ok(devfn >> 3)
     }
 
     #[cfg(feature = "host-device")]
@@ -1429,11 +1434,7 @@ mod tests {
             Some(vm.vm_config().clone()),
             vm.shared_info().clone(),
         );
-        #[cfg(target_arch = "x86_64")]
-        let guest_addr = GuestAddress(0x200000000000);
-        // TODO: #7290 - https://github.com/kata-containers/kata-containers/issues/7290
-        #[cfg(target_arch = "aarch64")]
-        let guest_addr = GuestAddress(0xF800000000);
+        let guest_addr = GuestAddress(*dbs_boot::layout::GUEST_MEM_END);
 
         let cache_len = 1024 * 1024 * 1024;
         let mmap_region = MmapRegion::build(

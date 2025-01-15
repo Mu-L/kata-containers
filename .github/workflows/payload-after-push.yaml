@@ -3,12 +3,10 @@ on:
   push:
     branches:
       - main
-      - stable-*
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build-assets-amd64:
@@ -50,7 +48,7 @@ jobs:
       commit-hash: ${{ github.sha }}
       registry: quay.io
       repo: kata-containers/kata-deploy-ci
-      tag: kata-containers-amd64
+      tag: kata-containers-latest-amd64
       target-branch: ${{ github.ref_name }}
     secrets: inherit
 
@@ -61,7 +59,7 @@ jobs:
       commit-hash: ${{ github.sha }}
       registry: quay.io
       repo: kata-containers/kata-deploy-ci
-      tag: kata-containers-arm64
+      tag: kata-containers-latest-arm64
       target-branch: ${{ github.ref_name }}
     secrets: inherit
 
@@ -72,7 +70,7 @@ jobs:
       commit-hash: ${{ github.sha }}
       registry: quay.io
       repo: kata-containers/kata-deploy-ci
-      tag: kata-containers-s390x
+      tag: kata-containers-latest-s390x
       target-branch: ${{ github.ref_name }}
     secrets: inherit
 
@@ -83,19 +81,19 @@ jobs:
       commit-hash: ${{ github.sha }}
       registry: quay.io
       repo: kata-containers/kata-deploy-ci
-      tag: kata-containers-ppc64le
+      tag: kata-containers-latest-ppc64le
       target-branch: ${{ github.ref_name }}
     secrets: inherit
 
   publish-manifest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: [publish-kata-deploy-payload-amd64, publish-kata-deploy-payload-arm64, publish-kata-deploy-payload-s390x, publish-kata-deploy-payload-ppc64le]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Login to Kata Containers quay.io
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: quay.io
           username: ${{ secrets.QUAY_DEPLOYER_USERNAME }}
@@ -103,9 +101,7 @@ jobs:
 
       - name: Push multi-arch manifest
         run: |
-          docker manifest create quay.io/kata-containers/kata-deploy-ci:kata-containers-latest \
-          --amend quay.io/kata-containers/kata-deploy-ci:kata-containers-amd64 \
-          --amend quay.io/kata-containers/kata-deploy-ci:kata-containers-arm64 \
-          --amend quay.io/kata-containers/kata-deploy-ci:kata-containers-s390x \
-          --amend quay.io/kata-containers/kata-deploy-ci:kata-containers-ppc64le
-          docker manifest push quay.io/kata-containers/kata-deploy-ci:kata-containers-latest
+          ./tools/packaging/release/release.sh publish-multiarch-manifest
+        env:
+          KATA_DEPLOY_IMAGE_TAGS: "kata-containers-latest"
+          KATA_DEPLOY_REGISTRIES: "quay.io/kata-containers/kata-deploy-ci"

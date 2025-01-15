@@ -9,6 +9,7 @@
 use crate::pod;
 use crate::policy;
 use crate::settings;
+use crate::utils::Config;
 use crate::yaml;
 
 use async_trait::async_trait;
@@ -17,7 +18,6 @@ use protocols::agent;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::boxed;
-use std::collections::BTreeMap;
 use std::marker::{Send, Sync};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -39,18 +39,14 @@ impl Debug for dyn yaml::K8sResource + Send + Sync {
 
 #[async_trait]
 impl yaml::K8sResource for List {
-    async fn init(&mut self, use_cache: bool, _doc_mapping: &serde_yaml::Value, silent: bool) {
+    async fn init(&mut self, config: &Config, _doc_mapping: &serde_yaml::Value, silent: bool) {
         // Create K8sResource objects for each item in this List.
         for item in &self.items {
             let yaml_string = serde_yaml::to_string(&item).unwrap();
             let (mut resource, _kind) = yaml::new_k8s_resource(&yaml_string, silent).unwrap();
-            resource.init(use_cache, item, silent).await;
+            resource.init(config, item, silent).await;
             self.resources.push(resource);
         }
-    }
-
-    fn get_sandbox_name(&self) -> Option<String> {
-        panic!("Unsupported");
     }
 
     fn get_container_mounts_and_storages(
@@ -83,21 +79,5 @@ impl yaml::K8sResource for List {
             self.items.push(doc_value.clone());
         }
         serde_yaml::to_string(&self).unwrap()
-    }
-
-    fn get_containers(&self) -> &Vec<pod::Container> {
-        panic!("Unsupported");
-    }
-
-    fn get_annotations(&self) -> &Option<BTreeMap<String, String>> {
-        panic!("Unsupported");
-    }
-
-    fn use_host_network(&self) -> bool {
-        panic!("Unsupported");
-    }
-
-    fn use_sandbox_pidns(&self) -> bool {
-        panic!("Unsupported");
     }
 }

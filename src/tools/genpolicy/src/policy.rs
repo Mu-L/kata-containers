@@ -9,17 +9,18 @@
 use crate::config_map;
 use crate::containerd;
 use crate::mount_and_storage;
+use crate::no_policy;
 use crate::pod;
 use crate::policy;
 use crate::registry;
 use crate::secret;
-use crate::settings;
 use crate::utils;
 use crate::yaml;
 
 use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
 use log::debug;
+use oci_spec::runtime as oci;
 use protocols::agent;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -28,9 +29,6 @@ use std::boxed;
 use std::collections::BTreeMap;
 use std::fs::read_to_string;
 use std::io::Write;
-
-// TODO: load this value from the settings file.
-const DEFAULT_OCI_VERSION: &str = "1.1.0-rc.1";
 
 /// Intermediary format of policy data.
 pub struct AgentPolicy {
@@ -47,10 +45,7 @@ pub struct AgentPolicy {
     /// Rego rules read from a file (rules.rego).
     pub rules: String,
 
-    /// Settings loaded from genpolicy-settings.json.
-    pub settings: settings::Settings,
-
-    /// Additional Policy settings.
+    /// Policy settings.
     pub config: utils::Config,
 }
 
@@ -63,6 +58,9 @@ pub struct PolicyData {
     /// Settings read from genpolicy-settings.json.
     pub common: CommonData,
 
+    /// Sandbox settings read from genpolicy-settings.json.
+    pub sandbox: SandboxData,
+
     /// Settings read from genpolicy-settings.json, related directly to each
     /// kata agent endpoint, that get added to the output policy.
     pub request_defaults: RequestDefaults,
@@ -73,10 +71,10 @@ pub struct PolicyData {
 /// is ordered, thus resulting in the same output policy contents every time
 /// when this apps runs with the same inputs. Also, it preserves the upper
 /// case field names, for consistency with the structs used by agent's rpc.rs.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct KataSpec {
     /// Version of the Open Container Initiative Runtime Specification with which the bundle complies.
-    #[serde(default = "version_default")]
+    #[serde(default)]
     pub Version: String,
 
     /// Process configures the container process.
@@ -101,10 +99,6 @@ pub struct KataSpec {
     /// Linux is platform-specific configuration for Linux based containers.
     #[serde(default)]
     pub Linux: KataLinux,
-}
-
-fn version_default() -> String {
-    DEFAULT_OCI_VERSION.to_string()
 }
 
 /// OCI container Process struct. This struct is very similar to the Process
@@ -190,6 +184,10 @@ pub struct KataLinux {
 
     /// ReadonlyPaths sets the provided paths as RO inside the container.
     pub ReadonlyPaths: Vec<String>,
+
+    /// Devices contains devices to be created inside the container.
+    #[serde(default)]
+    pub Devices: Vec<KataLinuxDevice>,
 }
 
 /// OCI container LinuxNamespace struct. This struct is similar to the LinuxNamespace
@@ -202,6 +200,18 @@ pub struct KataLinuxNamespace {
 
     /// Path is a path to an existing namespace persisted on disk that can be joined
     /// and is of the same type
+    pub Path: String,
+}
+
+/// OCI container LinuxDevice struct. This struct is similar to the LinuxDevice
+/// struct generated from oci.proto, but includes just the fields that are currently
+/// relevant for automatic generation of policy.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct KataLinuxDevice {
+    /// Type is the type of device.
+    pub Type: String,
+
+    /// Path is the path where the device should be created.
     pub Path: String,
 }
 
@@ -256,13 +266,16 @@ pub struct ContainerPolicy {
     /// Data compared with req.storages for CreateContainerRequest calls.
     storages: Vec<agent::Storage>,
 
+    /// Data compared with req.devices for CreateContainerRequest calls.
+    devices: Vec<agent::Device>,
+
     /// Data compared with req.sandbox_pidns for CreateContainerRequest calls.
     sandbox_pidns: bool,
 
     /// Allow list of ommand lines that are allowed to be executed using
     /// ExecProcessRequest. By default, all ExecProcessRequest calls are blocked
     /// by the policy.
-    exec_commands: Vec<String>,
+    exec_commands: Vec<Vec<String>>,
 }
 
 /// See Reference / Kubernetes API / Config and Storage Resources / Volume.
@@ -304,8 +317,12 @@ pub struct CreateContainerRequestDefaults {
 /// ExecProcessRequest settings from genpolicy-settings.json.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecProcessRequestDefaults {
+    /// Allow these commands to be executed. This field has been deprecated - use allowed_commands instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commands: Option<Vec<String>>,
+
     /// Allow these commands to be executed.
-    commands: Vec<String>,
+    pub allowed_commands: Vec<Vec<String>>,
 
     /// Allow commands matching these regexes to be executed.
     regex: Vec<String>,
@@ -324,8 +341,14 @@ pub struct RequestDefaults {
     /// Commands allowed to be executed by the Host in all Guest containers.
     pub ExecProcessRequest: ExecProcessRequestDefaults,
 
+    /// Allow the Host to close stdin for a container. Typically used with WriteStreamRequest.
+    pub CloseStdinRequest: bool,
+
     /// Allow Host reading from Guest containers stdout and stderr.
     pub ReadStreamRequest: bool,
+
+    /// Allow Host to update Guest mounts.
+    pub UpdateEphemeralMountsRequest: bool,
 
     /// Allow Host writing to Guest containers stdin.
     pub WriteStreamRequest: bool,
@@ -336,6 +359,9 @@ pub struct RequestDefaults {
 pub struct CommonData {
     /// Path to the shared container files - e.g., "/run/kata-containers/shared/containers".
     pub cpath: String,
+
+    /// Path to the shared container files for mount sources - e.g., "/run/kata-containers/shared/containers".
+    pub mount_source_cpath: String,
 
     /// Regex prefix for shared file paths - e.g., "^$(cpath)/$(bundle-id)-[a-z0-9]{16}-".
     pub sfprefix: String,
@@ -362,7 +388,15 @@ pub struct CommonData {
 /// Configuration from "kubectl config".
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterConfig {
-    default_namespace: String,
+    /// Pause container image reference.
+    pub pause_container_image: String,
+}
+
+/// Struct used to read data from the settings file and copy that data into the policy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SandboxData {
+    /// Expected value of the CreateSandboxRequest storages field.
+    pub storages: Vec<agent::Storage>,
 }
 
 impl AgentPolicy {
@@ -378,7 +412,23 @@ impl AgentPolicy {
                 let yaml_string = serde_yaml::to_string(&doc_mapping)?;
                 let silent = config.silent_unsupported_fields;
                 let (mut resource, kind) = yaml::new_k8s_resource(&yaml_string, silent)?;
-                resource.init(config.use_cache, &doc_mapping, silent).await;
+
+                // Filter out resources that don't match the runtime class name.
+                if let Some(resource_runtime_name) = resource.get_runtime_class_name() {
+                    if !config.runtime_class_names.is_empty()
+                        && !config
+                            .runtime_class_names
+                            .iter()
+                            .any(|prefix| resource_runtime_name.starts_with(prefix))
+                    {
+                        resource =
+                            boxed::Box::new(no_policy::NoPolicyResource { yaml: yaml_string });
+                        resources.push(resource);
+                        continue;
+                    }
+                }
+
+                resource.init(config, &doc_mapping, silent).await;
 
                 // ConfigMap and Secret documents contain additional input for policy generation.
                 if kind.eq("ConfigMap") {
@@ -399,8 +449,6 @@ impl AgentPolicy {
             }
         }
 
-        let settings = settings::Settings::new(&config.json_settings_path);
-
         if let Some(config_map_files) = &config.config_map_files {
             for file in config_map_files {
                 config_maps.push(config_map::ConfigMap::new(file)?);
@@ -411,7 +459,6 @@ impl AgentPolicy {
             Ok(AgentPolicy {
                 resources,
                 rules,
-                settings,
                 config_maps,
                 secrets,
                 config: config.clone(),
@@ -457,8 +504,9 @@ impl AgentPolicy {
 
         let policy_data = policy::PolicyData {
             containers: policy_containers,
-            request_defaults: self.settings.request_defaults.clone(),
-            common: self.settings.common.clone(),
+            request_defaults: self.config.settings.request_defaults.clone(),
+            common: self.config.settings.common.clone(),
+            sandbox: self.config.settings.sandbox.clone(),
         };
 
         let json_data = serde_json::to_string_pretty(&policy_data).unwrap();
@@ -475,15 +523,14 @@ impl AgentPolicy {
         yaml_container: &pod::Container,
         is_pause_container: bool,
     ) -> ContainerPolicy {
-        let c_settings = self.settings.get_container_settings(is_pause_container);
+        let c_settings = self
+            .config
+            .settings
+            .get_container_settings(is_pause_container);
         let mut root = c_settings.Root.clone();
         root.Readonly = yaml_container.read_only_root_filesystem();
 
-        let namespace = if let Some(ns) = resource.get_namespace() {
-            ns
-        } else {
-            self.settings.cluster_config.default_namespace.clone()
-        };
+        let namespace = resource.get_namespace().unwrap_or_default();
 
         let use_host_network = resource.use_host_network();
         let annotations = get_container_annotations(
@@ -507,7 +554,7 @@ impl AgentPolicy {
 
         let mut mounts = containerd::get_mounts(is_pause_container, is_privileged);
         mount_and_storage::get_policy_mounts(
-            &self.settings,
+            &self.config.settings,
             &mut mounts,
             yaml_container,
             is_pause_container,
@@ -520,17 +567,19 @@ impl AgentPolicy {
             &mut mounts,
             &mut storages,
             yaml_container,
-            &self.settings,
+            &self.config.settings,
         );
 
         let mut linux = containerd::get_linux(is_privileged);
         linux.Namespaces = get_kata_namespaces(is_pause_container, use_host_network);
 
         if !c_settings.Linux.MaskedPaths.is_empty() {
-            linux.MaskedPaths = c_settings.Linux.MaskedPaths.clone();
+            linux.MaskedPaths.clone_from(&c_settings.Linux.MaskedPaths);
         }
         if !c_settings.Linux.ReadonlyPaths.is_empty() {
-            linux.ReadonlyPaths = c_settings.Linux.ReadonlyPaths.clone();
+            linux
+                .ReadonlyPaths
+                .clone_from(&c_settings.Linux.ReadonlyPaths);
         }
 
         let sandbox_pidns = if is_pause_container {
@@ -540,9 +589,26 @@ impl AgentPolicy {
         };
         let exec_commands = yaml_container.get_exec_commands();
 
+        let mut devices: Vec<agent::Device> = vec![];
+        if let Some(volumeDevices) = &yaml_container.volumeDevices {
+            for volumeDevice in volumeDevices {
+                let mut device = agent::Device::new();
+                device.set_container_path(volumeDevice.devicePath.clone());
+                devices.push(device);
+
+                linux.Devices.push(KataLinuxDevice {
+                    Type: "".to_string(),
+                    Path: volumeDevice.devicePath.clone(),
+                })
+            }
+        }
+        for default_device in &c_settings.Linux.Devices {
+            linux.Devices.push(default_device.clone())
+        }
+
         ContainerPolicy {
             OCI: KataSpec {
-                Version: version_default(),
+                Version: self.config.settings.kata_config.oci_version.clone(),
                 Process: process,
                 Root: root,
                 Mounts: mounts,
@@ -551,6 +617,7 @@ impl AgentPolicy {
                 Linux: linux,
             },
             storages,
+            devices,
             sandbox_pidns,
             exec_commands,
         }
@@ -567,9 +634,9 @@ impl AgentPolicy {
     ) -> KataProcess {
         // Start with the Default Unix Spec from
         // https://github.com/containerd/containerd/blob/release/1.6/oci/spec.go#L132
-        let mut process = containerd::get_process(is_privileged, &self.settings.common);
+        let mut process = containerd::get_process(is_privileged, &self.config.settings.common);
 
-        yaml_container.apply_capabilities(&mut process.Capabilities, &self.settings.common);
+        yaml_container.apply_capabilities(&mut process.Capabilities, &self.config.settings.common);
 
         let (yaml_has_command, yaml_has_args) = yaml_container.get_process_args(&mut process.Args);
         yaml_container
@@ -604,8 +671,10 @@ impl AgentPolicy {
 
         substitute_env_variables(&mut process.Env);
         substitute_args_env_variables(&mut process.Args, &process.Env);
+
         c_settings.get_process_fields(&mut process);
-        process.NoNewPrivileges = !yaml_container.allow_privilege_escalation();
+        resource.get_process_fields(&mut process);
+        yaml_container.get_process_fields(&mut process);
 
         process
     }
@@ -659,7 +728,7 @@ fn get_image_layer_storages(
             "previous_chain_id = {}, chain_id = {}",
             &previous_chain_id, &chain_id
         );
-        previous_chain_id = chain_id.clone();
+        previous_chain_id.clone_from(&chain_id);
 
         layer_names.push(name_to_hash(&chain_id));
         layer_hashes.push(layer.verity_hash.to_string());

@@ -15,7 +15,9 @@ on:
 
 jobs:
   run-runk:
-    runs-on: garm-ubuntu-2204-smaller
+    # Skip runk tests as we have no maintainers. TODO: Decide when to remove altogether
+    if: false
+    runs-on: ubuntu-22.04
     env:
       CONTAINERD_VERSION: lts
     steps:
@@ -34,7 +36,7 @@ jobs:
         run: bash tests/integration/runk/gha-run.sh install-dependencies
 
       - name: get-kata-tarball
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
           path: kata-artifacts
@@ -42,5 +44,5 @@ jobs:
       - name: Install kata
         run: bash tests/integration/runk/gha-run.sh install-kata kata-artifacts
 
-      - name: Run tracing tests
+      - name: Run runk tests
         run: bash tests/integration/runk/gha-run.sh run

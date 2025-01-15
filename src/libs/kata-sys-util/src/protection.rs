@@ -7,6 +7,7 @@
 use anyhow::anyhow;
 #[cfg(any(target_arch = "s390x", target_arch = "x86_64", target_arch = "aarch64"))]
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 #[cfg(target_arch = "x86_64")]
 use std::path::Path;
@@ -19,14 +20,14 @@ use nix::unistd::Uid;
 #[cfg(target_arch = "x86_64")]
 use std::fs;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TDXDetails {
     pub major_version: u32,
     pub minor_version: u32,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum GuestProtection {
     #[default]
     NoProtection,

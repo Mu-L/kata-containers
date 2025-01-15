@@ -26,9 +26,15 @@ jobs:
   kata-payload:
     runs-on: ppc64le
     steps:
+      - name: Prepare the self-hosted runner
+        timeout-minutes: 15
+        run: |
+          "${HOME}/scripts/prepare_runner.sh"
+          sudo rm -rf "$GITHUB_WORKSPACE"/*
+
       - name: Adjust a permission for repo
         run: |
-          sudo chown -R $USER:$USER $GITHUB_WORKSPACE
+          sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE"
 
       - uses: actions/checkout@v4
         with:
@@ -42,13 +48,13 @@ jobs:
           TARGET_BRANCH: ${{ inputs.target-branch }}
 
       - name: get-kata-tarball
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: kata-static-tarball-ppc64le${{ inputs.tarball-suffix }}
 
       - name: Login to Kata Containers quay.io
         if: ${{ inputs.registry == 'quay.io' }}
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: quay.io
           username: ${{ secrets.QUAY_DEPLOYER_USERNAME }}
@@ -56,7 +62,7 @@ jobs:
 
       - name: Login to Kata Containers ghcr.io
         if: ${{ inputs.registry == 'ghcr.io' }}
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -66,5 +72,5 @@ jobs:
         id: build-and-push-kata-payload
         run: |
           ./tools/packaging/kata-deploy/local-build/kata-deploy-build-and-upload-payload.sh \
-          $(pwd)/kata-static.tar.xz \
+          "$(pwd)"/kata-static.tar.xz \
           ${{ inputs.registry }}/${{ inputs.repo }} ${{ inputs.tag }}
