@@ -10,6 +10,8 @@
 this_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export repo_root_dir="$(cd "${this_script_dir}/../" && pwd)"
 
+source "${this_script_dir}/error.sh"
+
 # Kata tests directory used for storing various test-related artifacts.
 KATA_TESTS_BASEDIR="${KATA_TESTS_BASEDIR:-/var/log/kata-tests}"
 
@@ -26,9 +28,39 @@ KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu}"
 
 RUNTIME="${RUNTIME:-containerd-shim-kata-v2}"
 
+export branch="${target_branch:-main}"
+
 function die() {
 	local msg="$*"
-	echo -e "[$(basename $0):${BASH_LINENO[0]}] ERROR: $msg" >&2
+
+	if [ -z "${KATA_TEST_VERBOSE:-}" ]; then
+		echo -e "[$(basename $0):${BASH_LINENO[0]}] ERROR: $msg" >&2
+		exit 1
+	fi
+
+	echo >&2 "ERROR: $msg"
+
+	# This function is called to indicate a fatal error occurred, so
+	# the caller of this function is the site of the detected error.
+	local error_location
+	error_location=$(caller 0)
+
+	local line
+	local func
+	local file
+
+	line=$(echo "$error_location"|awk '{print $1}')
+	func=$(echo "$error_location"|awk '{print $2}')
+	file=$(echo "$error_location"|awk '{print $3}')
+
+	local path
+	path=$(resolve_path "$file")
+
+	dump_details \
+		"${line}" \
+		"${func}" \
+		"${path}"
+
 	exit 1
 }
 
@@ -42,6 +74,12 @@ function info() {
 	echo -e "[$(basename $0):${BASH_LINENO[0]}] INFO: $msg"
 }
 
+function bats_unbuffered_info() {
+	local msg="$*"
+	# Ask bats to print this text immediately rather than buffering until the end of a test case.
+	echo -e "[$(basename $0):${BASH_LINENO[0]}] UNBUFFERED: INFO: $msg" >&3
+}
+
 function handle_error() {
 	local exit_code="${?}"
 	local line_number="${1:-}"
@@ -49,6 +87,22 @@ function handle_error() {
 	exit "${exit_code}"
 }
 trap 'handle_error $LINENO' ERR
+
+# A wrapper function for kubectl with retry logic
+# runs the command up to 5 times with a 15-second interval
+# to ensure successful execution
+function kubectl_retry() {
+	local max_tries=5
+	local interval=15
+	local i=0
+	while true; do
+		kubectl $@ && return 0 || true
+		i=$((i + 1))
+		[ $i -lt $max_tries ] && echo "'kubectl $@' failed, retrying in $interval seconds" 1>&2 || break
+		sleep $interval
+	done
+	echo "'kubectl $@' failed after $max_tries tries" 1>&2 && return 1
+}
 
 function waitForProcess() {
 	wait_time="$1"
@@ -89,6 +143,10 @@ function extract_kata_env() {
 	local hypervisor_path
 	local virtiofsd_path
 	local initrd_path
+	local kata_env
+	local req_memory_amount
+	local req_num_vcpus
+
 	case "${KATA_HYPERVISOR}" in
 		dragonball)
 			cmd=kata-ctl
@@ -100,6 +158,7 @@ function extract_kata_env() {
 			hypervisor_path=".hypervisor.path"
 			virtio_fs_daemon_path=".hypervisor.virtio_fs_daemon"
 			initrd_path=".initrd.path"
+			shared_fs=".hypervisor.shared_fs"
 			;;
 		*)
 			cmd=kata-runtime
@@ -111,18 +170,34 @@ function extract_kata_env() {
 			hypervisor_path=".Hypervisor.Path"
 			virtio_fs_daemon_path=".Hypervisor.VirtioFSDaemon"
 			initrd_path=".Initrd.Path"
+			shared_fs=".Hypervisor.SharedFS"
+			req_memory_amount=".Host.Memory.Total"
+			req_num_vcpus=""
 			;;
 	esac
-	RUNTIME_CONFIG_PATH=$(sudo ${cmd} env --json | jq -r ${config_path})
-	RUNTIME_VERSION=$(sudo ${cmd} env --json | jq -r ${runtime_version} | grep ${runtime_version_semver} | cut -d'"' -f4)
-	RUNTIME_COMMIT=$(sudo ${cmd} env --json | jq -r ${runtime_version} | grep ${runtime_version_commit} | cut -d'"' -f4)
-	RUNTIME_PATH=$(sudo ${cmd} env --json | jq -r ${runtime_path})
+	kata_env="$(sudo ${cmd} env --json)"
+
+	RUNTIME_CONFIG_PATH="$(echo "${kata_env}" | jq -r ${config_path})"
+	RUNTIME_VERSION="$(echo "${kata_env}" | jq -r ${runtime_version} | grep ${runtime_version_semver} | cut -d'"' -f4)"
+	RUNTIME_COMMIT="$(echo "${kata_env}" | jq -r ${runtime_version} | grep ${runtime_version_commit} | cut -d'"' -f4)"
+	RUNTIME_PATH="$(echo "${kata_env}" | jq -r ${runtime_path})"
+	SHARED_FS="$(echo "${kata_env}" | jq -r ${shared_fs})"
+
+	# get the requested memory and num of vcpus from the kata config file.
+	config_content="$(cat ${RUNTIME_CONFIG_PATH} | grep -vE "^#")"
+	REQ_MEMORY="$(echo "${config_content}" | grep -i 'default_memory =' | cut -d  "=" -f2 | awk '{print $1}')"
+	REQ_NUM_VCPUS="$(echo "${config_content}" | grep -i 'default_vcpus =' | cut -d  "=" -f2 | awk '{print $1}')"
 
 	# Shimv2 path is being affected by https://github.com/kata-containers/kata-containers/issues/1151
-	SHIM_PATH=$(readlink $(command -v containerd-shim-kata-v2))
+	SHIM_PATH=$(command -v containerd-shim-kata-v2)
+	[ -L ${SHIM_PATH} ] && SHIM_PATH=$(readlink ${SHIM_PATH})
+
 	SHIM_VERSION=${RUNTIME_VERSION}
 
-	HYPERVISOR_PATH=$(sudo ${cmd} env --json | jq -r ${hypervisor_path})
+	HYPERVISOR_PATH=$(echo "${kata_env}" | jq -r ${hypervisor_path})
+	VIRTIOFSD_PATH=$(echo "${kata_env}" | jq -r ${virtio_fs_daemon_path})
+	INITRD_PATH=$(echo "${kata_env}" | jq -r ${initrd_path})
+
 	# TODO: there is no ${cmd} of rust version currently
 	if [ "${KATA_HYPERVISOR}" != "dragonball" ]; then
 		if [ "${KATA_HYPERVISOR}" = "stratovirt" ]; then
@@ -131,9 +206,6 @@ function extract_kata_env() {
 			HYPERVISOR_VERSION=$(sudo -E ${HYPERVISOR_PATH} --version | head -n1)
 		fi
 	fi
-	VIRTIOFSD_PATH=$(sudo ${cmd} env --json | jq -r ${virtio_fs_daemon_path})
-
-	INITRD_PATH=$(sudo ${cmd} env --json | jq -r ${initrd_path})
 }
 
 # Checks that processes are not running
@@ -236,7 +308,7 @@ function kill_kata_components() {
 	# iterate over the list of kata components and stop them
 	for (( i=1; i<=ATTEMPTS; i++ )); do
 		for PID_NAME in "${PID_NAMES[@]}"; do
-			[[ ! -z "$(pidof ${PID_NAME})" ]] && sudo killall "${PID_NAME}" >/dev/null 2>&1 || true
+			[[ ! -z "$(pidof ${PID_NAME})" ]] && sudo killall -w -s SIGKILL "${PID_NAME}" >/dev/null 2>&1 || true
 		done
 		sleep 1
 	done
@@ -371,11 +443,10 @@ log_level = "debug"
 EOF
 }
 
-function install_kata() {
-	local kata_tarball="kata-static.tar.xz"
-	declare -r katadir="/opt/kata"
+function install_kata_core() {
+	declare -r katadir="$1"
 	declare -r destdir="/"
-	declare -r local_bin_dir="/usr/local/bin/"
+	declare -r kata_tarball="kata-static.tar.xz"
 
 	# Removing previous kata installation
 	sudo rm -rf "${katadir}"
@@ -383,6 +454,20 @@ function install_kata() {
 	pushd "${kata_tarball_dir}"
 	sudo tar -xvf "${kata_tarball}" -C "${destdir}"
 	popd
+}
+
+function install_kata_tools() {
+	declare -r katadir="/opt/kata"
+
+	# TODO: implement a better way to install the tools - see issue #8864.
+	install_kata_core "${katadir}"
+}
+
+function install_kata() {
+	declare -r katadir="/opt/kata"
+	declare -r local_bin_dir="/usr/local/bin/"
+
+	install_kata_core "${katadir}"
 
 	# create symbolic links to kata components
 	for b in "${katadir}"/bin/* ; do
@@ -407,7 +492,7 @@ function enabling_hypervisor() {
 	declare -r CONTAINERD_SHIM_KATA="/usr/local/bin/containerd-shim-kata-${KATA_HYPERVISOR}-v2"
 
 	case "${KATA_HYPERVISOR}" in
-		dragonball | cloud-hypervisor)
+		dragonball|cloud-hypervisor|qemu-runtime-rs)
 			sudo ln -sf "${KATA_DIR}/runtime-rs/bin/containerd-shim-kata-v2" "${CONTAINERD_SHIM_KATA}"
 			declare -r CONFIG_DIR="${KATA_DIR}/share/defaults/kata-containers/runtime-rs"
 			;;
@@ -443,20 +528,51 @@ function check_containerd_config_for_kata() {
 }
 
 function ensure_yq() {
-    : "${GOPATH:=${GITHUB_WORKSPACE:-$HOME/go}}"
-    export GOPATH
-    export PATH="${GOPATH}/bin:${PATH}"
-    INSTALL_IN_GOPATH=true "${repo_root_dir}/ci/install_yq.sh"
-    hash -d yq 2> /dev/null || true # yq is preinstalled on GHA Ubuntu 22.04 runners so we clear Bash's PATH cache.
+	: "${GOPATH:=${GITHUB_WORKSPACE:-$HOME/go}}"
+	export GOPATH
+	export PATH="${GOPATH}/bin:${PATH}"
+	INSTALL_IN_GOPATH=true "${repo_root_dir}/ci/install_yq.sh"
+	hash -d yq 2> /dev/null || true # yq is preinstalled on GHA Ubuntu 22.04 runners so we clear Bash's PATH cache.
+}
+
+function ensure_helm() {
+	ensure_yq
+	# The get-helm-3 script will take care of downloaading and installing Helm
+	# properly on the system respecting ARCH, OS and other configurations.
+	DESIRED_VERSION=$(get_from_kata_deps ".externals.helm.version")
+	export DESIRED_VERSION
+
+	# Check if helm is available in the system's PATH
+	if ! command -v helm &> /dev/null; then
+		echo "Helm is not installed. Installing Helm..."
+		curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+		# Verify the installation
+		if command -v helm &> /dev/null; then
+			echo "Helm installed successfully."
+		else
+			echo "Failed to install Helm."
+			exit 1
+		fi
+	else
+		echo "Helm is already installed."
+	fi
 }
 
 # dependency: What we want to get the version from the versions.yaml file
 function get_from_kata_deps() {
-        local dependency="$1"
         versions_file="${repo_root_dir}/versions.yaml"
 
         command -v yq &>/dev/null || die 'yq command is not in your $PATH'
-        result=$("yq" read -X "$versions_file" "$dependency")
+
+        yq_version=$(yq --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | cut -d. -f1)
+        if [ "$yq_version" -eq 3 ]; then
+          dependency=$(echo "$1" | sed "s/^\.//g")
+          result=$("yq" read "$versions_file" "$dependency")
+        else
+          dependency=$1
+          result=$("yq" "$dependency | explode (.)" "$versions_file")
+        fi
+
         [ "$result" = "null" ] && result=""
         echo "$result"
 }
@@ -503,6 +619,63 @@ function install_cni_plugins() {
 	sudo mkdir -p /opt/cni/bin
 	sudo tar -xvf "${tarball_name}" -C /opt/cni/bin
 	rm -f "${tarball_name}"
+
+	cni_config="/etc/cni/net.d/10-containerd-net.conflist"
+	if [ ! -f ${cni_config} ];then
+		sudo mkdir -p /etc/cni/net.d
+		sudo tee "${cni_config}" << EOF
+{
+  "cniVersion": "1.0.0",
+  "name": "containerd-net",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "cni0",
+      "isGateway": true,
+      "ipMasq": true,
+      "promiscMode": true,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [
+          [{
+            "subnet": "10.88.0.0/16"
+          }],
+          [{
+            "subnet": "2001:4860:4860::/64"
+          }]
+        ],
+        "routes": [
+          { "dst": "0.0.0.0/0" },
+          { "dst": "::/0" }
+        ]
+      }
+    },
+    {
+      "type": "portmap",
+      "capabilities": {"portMappings": true}
+    }
+  ]
+}
+EOF
+	fi
+}
+
+# version: The version to be installed
+function install_runc() {
+	base_version="${1}"
+	project="opencontainers/runc"
+	version=$(get_latest_patch_release_from_a_github_project "${project}" "${base_version}")
+
+	if [ -f /usr/local/sbin/runc ]; then
+		return
+	fi
+
+	binary_name="runc.$(${repo_root_dir}/tests/kata-arch.sh -g)"
+	download_github_project_tarball "${project}" "${version}" "${binary_name}"
+
+	sudo mkdir -p /usr/local/sbin
+	sudo mv $binary_name /usr/local/sbin/runc
+	sudo chmod +x /usr/local/sbin/runc
 }
 
 # base_version: The version to be intalled in the ${major}.${minor} format
@@ -512,14 +685,53 @@ function install_cri_containerd() {
 	project="containerd/containerd"
 	version=$(get_latest_patch_release_from_a_github_project "${project}" "${base_version}")
 
-	tarball_name="cri-containerd-cni-${version//v}-linux-$(${repo_root_dir}/tests/kata-arch.sh -g).tar.gz"
+	tarball_name="containerd-${version//v}-linux-$(${repo_root_dir}/tests/kata-arch.sh -g).tar.gz"
 
 	download_github_project_tarball "${project}" "${version}" "${tarball_name}"
-	sudo tar -xvf "${tarball_name}" -C /
+	#add the "--keep-directory-symlink" option to make sure the untar wouldn't override the
+	#system rootfs's bin/sbin directory which would be a symbol link to /usr/bin or /usr/sbin.
+	if [ ! -f /usr/local ]; then
+		sudo mkdir -p /usr/local
+	fi
+	sudo tar --keep-directory-symlink -xvf "${tarball_name}" -C /usr/local/
 	rm -f "${tarball_name}"
 
 	sudo mkdir -p /etc/containerd
 	containerd config default | sudo tee /etc/containerd/config.toml
+
+	containerd_service="/etc/systemd/system/containerd.service"
+
+	if [ ! -f ${containerd_service} ]; then
+		sudo mkdir -p /etc/systemd/system
+		sudo tee ${containerd_service}  <<EOF
+[Unit]
+Description=containerd container runtime
+Documentation=https://containerd.io
+After=network.target local-fs.target
+
+[Service]
+ExecStartPre=-/sbin/modprobe overlay
+ExecStart=/usr/local/bin/containerd
+
+Type=notify
+Delegate=yes
+KillMode=process
+Restart=always
+RestartSec=5
+# Having non-zero Limit*s causes performance problems due to accounting overhead
+# in the kernel. We recommend using cgroups to do container-local accounting.
+LimitNPROC=infinity
+LimitCORE=infinity
+LimitNOFILE=infinity
+# Comment TasksMax if your systemd version does not supports it.
+# Only systemd 226 and above support this version.
+TasksMax=infinity
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	fi 
 }
 
 # base_version: The version to be intalled in the ${major}.${minor} format
@@ -551,41 +763,36 @@ function install_nydus_snapshotter() {
 	version="${1}"
 
 	project="containerd/nydus-snapshotter"
-	tarball_name="nydus-snapshotter-${version}-$(${repo_root_dir}/tests/kata-arch.sh).tgz"
+	tarball_name="nydus-snapshotter-${version}-$(uname -s| tr A-Z a-z)-$(${repo_root_dir}/tests/kata-arch.sh -g).tar.gz"
 
 	download_github_project_tarball "${project}" "${version}" "${tarball_name}"
 	sudo tar xfz "${tarball_name}" -C /usr/local/bin --strip-components=1
 	rm -f "${tarball_name}"
 }
 
-function _get_os_for_crio() {
-	source /etc/os-release
-
-	if [ "${NAME}" != "Ubuntu" ]; then
-		echo "Only Ubuntu is supported for now"
-		exit 2
-	fi
-
-	echo "x${NAME}_${VERSION_ID}"
-}
-
 # version: the CRI-O version to be installe
 function install_crio() {
 	local version=${1}
 
-	os=$(_get_os_for_crio)
+	sudo mkdir -p /etc/apt/keyrings
+	sudo mkdir -p /etc/apt/sources.list.d
 
-	echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/${os}/ /"|sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
-	echo "deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/${version}/${os}/ /"|sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable:cri-o:${version}.list
-	curl -L https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable:cri-o:${version}/${os}/Release.key | sudo apt-key add -
-	curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/${os}/Release.key | sudo apt-key add -
+	curl -fsSL https://pkgs.k8s.io/addons:/cri-o:/stable:/v${version}/deb/Release.key | \
+		sudo gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+	echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v${version}/deb/ /" | \
+		sudo tee /etc/apt/sources.list.d/cri-o.list
+
 	sudo apt update
-	sudo apt install -y cri-o cri-o-runc
+	sudo apt install -y cri-o
 
 	# We need to set the default capabilities to ensure our tests will pass
 	# See: https://github.com/kata-containers/kata-containers/issues/8034
 	sudo mkdir -p /etc/crio/crio.conf.d/
 	cat <<EOF | sudo tee /etc/crio/crio.conf.d/00-default-capabilities
+[crio]
+storage_option = [
+	"overlay.skip_mount_home=true",
+]
 [crio.runtime]
 default_capabilities = [
        "CHOWN",
@@ -703,7 +910,7 @@ function get_dep_from_yaml_db(){
 
         "${repo_root_dir}/ci/install_yq.sh" >&2
 
-        result=$("${GOPATH}/bin/yq" r -X "$versions_file" "$dependency")
+        result=$("${GOPATH}/bin/yq" "$dependency" "$versions_file")
         [ "$result" = "null" ] && result=""
         echo "$result"
 }
@@ -719,7 +926,7 @@ function get_test_version(){
 
         db="${cidir}/../versions.yaml"
 
-        get_dep_from_yaml_db "${db}" "${dependency}"
+        get_dep_from_yaml_db "${db}" ".${dependency}"
 }
 
 # Load vhost, vhost_net, vhost_vsock modules.
@@ -727,4 +934,49 @@ function load_vhost_mods() {
 	sudo modprobe vhost
 	sudo modprobe vhost_net
 	sudo modprobe vhost_vsock
+}
+
+function run_static_checks()
+{
+	# Make sure we have the targeting branch
+	git remote set-branches --add origin "${branch}"
+	git fetch -a
+	bash "$this_script_dir/static-checks.sh" "$@"
+}
+
+function run_docs_url_alive_check()
+{
+	# Make sure we have the targeting branch
+	git remote set-branches --add origin "${branch}"
+	git fetch -a
+	bash "$this_script_dir/static-checks.sh" --docs --all "github.com/kata-containers/kata-containers"
+}
+
+function run_get_pr_changed_file_details()
+{
+	# Make sure we have the targeting branch
+	git remote set-branches --add origin "${branch}"
+	git fetch -a
+	get_pr_changed_file_details
+}
+
+# Check if the 1st argument version is greater than and equal to 2nd one
+# Version format: [0-9]+ separated by period (e.g. 2.4.6, 1.11.3 and etc.)
+#
+# Parameters:
+#	$1	- a version to be tested
+#	$2	- a target version
+#
+# Return:
+# 	0 if $1 is greater than and equal to $2
+#	1 otherwise
+function version_greater_than_equal() {
+	local current_version=$1
+	local target_version=$2
+	smaller_version=$(echo -e "$current_version\n$target_version" | sort -V | head -1)
+	if [ "${smaller_version}" = "${target_version}" ]; then
+		return 0
+	else
+		return 1
+	fi
 }

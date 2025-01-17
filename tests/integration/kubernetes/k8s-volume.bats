@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 TEST_INITRD="${TEST_INITRD:-no}"
@@ -16,7 +17,8 @@ setup() {
 	get_pod_config_dir
 
 	node=$(get_one_kata_node)
-	tmp_file=$(exec_host "$node" mktemp -d /tmp/data.XXXX)
+	tmp_file=$(mktemp -u /tmp/data.XXXX)
+	exec_host "$node" mkdir $tmp_file
 	pv_yaml=$(mktemp --tmpdir pv_config.XXXXXX.yaml)
 	pod_yaml=$(mktemp --tmpdir pod_config.XXXXXX.yaml)
 	msg="Hello from Kubernetes"
@@ -26,6 +28,7 @@ setup() {
 	sed -e "s|tmp_data|${tmp_file}|g" ${pod_config_dir}/pv-volume.yaml > "$pv_yaml"
 	sed -e "s|NODE|${node}|g" "${pod_config_dir}/pv-pod.yaml" > "$pod_yaml"
 
+	add_allow_all_policy_to_yaml "${pod_yaml}"
 }
 
 @test "Create Persistent Volume" {

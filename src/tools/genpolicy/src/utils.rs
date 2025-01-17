@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use crate::settings;
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -64,21 +65,59 @@ struct CommandLineOptions {
         help = "Ignore unsupported input Kubernetes YAML fields. This is not recommeded unless you understand exactly how genpolicy works!"
     )]
     silent_unsupported_fields: bool,
+
+    #[clap(
+        short = 'd',
+        long,
+        help = "If specified, will use existing containerd service to pull container images. This option is only supported on Linux",
+        // from https://docs.rs/clap/4.1.8/clap/struct.Arg.html#method.default_missing_value
+        default_missing_value = "/var/run/containerd/containerd.sock", // used if flag is present but no value is given
+        num_args = 0..=1,
+        require_equals= true
+    )]
+    containerd_socket_path: Option<String>,
+
+    #[clap(
+        long,
+        help = "Registry that uses plain HTTP. Can be passed more than once to configure multiple insecure registries."
+    )]
+    insecure_registry: Vec<String>,
+
+    #[clap(
+        long,
+        help = "If specified, resources that have a runtimeClassName field defined will only receive a policy if the parameter is a prefix one of the given runtime class names."
+    )]
+    runtime_class_names: Vec<String>,
+
+    #[clap(
+        long,
+        help = "Path to the layers cache file. This file is used to store the layers cache information. The default value is ./layers-cache.json.",
+        default_missing_value = "./layers-cache.json",
+        require_equals = true
+    )]
+    layers_cache_file_path: Option<String>,
+    #[clap(short, long, help = "Print version information and exit")]
+    version: bool,
 }
 
 /// Application configuration, derived from on command line parameters.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub use_cache: bool,
+    pub insecure_registries: Vec<String>,
+    pub runtime_class_names: Vec<String>,
 
     pub yaml_file: Option<String>,
     pub rego_rules_path: String,
-    pub json_settings_path: String,
+    pub settings: settings::Settings,
     pub config_map_files: Option<Vec<String>>,
 
     pub silent_unsupported_fields: bool,
     pub raw_out: bool,
     pub base64_out: bool,
+    pub containerd_socket_path: Option<String>,
+    pub layers_cache_file_path: Option<String>,
+    pub version: bool,
 }
 
 impl Config {
@@ -96,15 +135,28 @@ impl Config {
             None
         };
 
+        let mut layers_cache_file_path = args.layers_cache_file_path;
+        // preserve backwards compatibility for only using the `use_cached_files` flag
+        if args.use_cached_files && layers_cache_file_path.is_none() {
+            layers_cache_file_path = Some(String::from("./layers-cache.json"));
+        }
+
+        let settings = settings::Settings::new(&args.json_settings_path);
+
         Self {
             use_cache: args.use_cached_files,
+            insecure_registries: args.insecure_registry,
+            runtime_class_names: args.runtime_class_names,
             yaml_file: args.yaml_file,
             rego_rules_path: args.rego_rules_path,
-            json_settings_path: args.json_settings_path,
+            settings,
             config_map_files: cm_files,
             silent_unsupported_fields: args.silent_unsupported_fields,
             raw_out: args.raw_out,
             base64_out: args.base64_out,
+            containerd_socket_path: args.containerd_socket_path,
+            layers_cache_file_path,
+            version: args.version,
         }
     }
 }

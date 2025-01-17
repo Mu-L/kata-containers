@@ -16,6 +16,7 @@ use nix::unistd::{self, Pid};
 use nix::Result;
 
 use oci::Process as OCIProcess;
+use oci_spec::runtime as oci;
 use slog::Logger;
 
 use crate::pipestream::PipeStream;
@@ -54,11 +55,6 @@ pub struct ProcessIo {
     pub stdin: Option<VsockStream>,
     pub stdout: Option<VsockStream>,
     pub stderr: Option<VsockStream>,
-    // used to close stdin stream
-    pub close_stdin_tx: tokio::sync::watch::Sender<bool>,
-    pub close_stdin_rx: tokio::sync::watch::Receiver<bool>,
-    // wait for stdin copy task to finish
-    pub wg_input: WaitGroup,
     // used to wait for all process outputs to be copied to the vsock streams
     // only used when tty is used.
     pub wg_output: WaitGroup,
@@ -70,15 +66,10 @@ impl ProcessIo {
         stdout: Option<VsockStream>,
         stderr: Option<VsockStream>,
     ) -> Self {
-        let (close_stdin_tx, close_stdin_rx) = tokio::sync::watch::channel(false);
-
         ProcessIo {
             stdin,
             stdout,
             stderr,
-            close_stdin_tx,
-            close_stdin_rx,
-            wg_input: WaitGroup::new(),
             wg_output: WaitGroup::new(),
         }
     }
@@ -157,7 +148,7 @@ impl Process {
             exit_tx: Some(exit_tx),
             exit_rx: Some(exit_rx),
             extra_files: Vec::new(),
-            tty: ocip.terminal,
+            tty: ocip.terminal().unwrap_or_default(),
             term_master: None,
             parent_stdin: None,
             parent_stdout: None,
@@ -210,17 +201,8 @@ impl Process {
     }
 
     pub async fn close_stdin(&mut self) {
-        if let Some(proc_io) = &mut self.proc_io {
-            // notify io copy task to close stdin stream
-            let _ = proc_io.close_stdin_tx.send(true);
-            // wait for io copy task to finish
-            proc_io.wg_input.wait().await;
-        }
-
         close_process_stream!(self, term_master, TermMaster);
         close_process_stream!(self, parent_stdin, ParentStdin);
-
-        self.notify_term_close();
     }
 
     pub fn cleanup_process_stream(&mut self) {

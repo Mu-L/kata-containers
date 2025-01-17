@@ -67,6 +67,7 @@ metadata
 microcontroller/AB
 miniOS
 mmap/AB
+MonitorTest/A
 nack/AB
 namespace/ABCD
 netlink
@@ -133,3 +134,4 @@ Upcall
 ioctl/A
 struct/A # struct in Rust
 Struct/A
+intel

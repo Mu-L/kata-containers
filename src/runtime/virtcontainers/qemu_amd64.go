@@ -31,6 +31,10 @@ type qemuAmd64 struct {
 	devLoadersCount uint32
 
 	sgxEPCSize int64
+
+	qgsPort uint32
+
+	snpCertsPath string
 }
 
 const (
@@ -123,8 +127,10 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 			protection:           noneProtection,
 			legacySerial:         config.LegacySerial,
 		},
-		vmFactory: factory,
-		snpGuest:  config.ConfidentialGuest,
+		vmFactory:    factory,
+		snpGuest:     config.SevSnpGuest,
+		qgsPort:      config.QgsPort,
+		snpCertsPath: config.SnpCertsPath,
 	}
 
 	if config.ConfidentialGuest {
@@ -282,6 +288,7 @@ func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware,
 			govmmQemu.Object{
 				Driver:         govmmQemu.Loader,
 				Type:           govmmQemu.TDXGuest,
+				QgsPort:        q.qgsPort,
 				ID:             "tdx",
 				DeviceID:       fmt.Sprintf("fd%d", id),
 				Debug:          false,
@@ -307,6 +314,7 @@ func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware,
 				File:            firmware,
 				CBitPos:         cpuid.AMDMemEncrypt.CBitPosition,
 				ReducedPhysBits: 1,
+				SnpCertsPath:    q.snpCertsPath,
 			}), "", nil
 	case noneProtection:
 

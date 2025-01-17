@@ -479,15 +479,20 @@ func TestAppendDevicesEmptyContainerDeviceList(t *testing.T) {
 func TestAppendDevices(t *testing.T) {
 	k := kataAgent{}
 
-	id := "test-append-block"
+	testBlockDeviceID := "test-block-device"
+	testCharacterDeviceId := "test-character-device"
+
 	ctrDevices := []api.Device{
 		&drivers.BlockDevice{
 			GenericDevice: &drivers.GenericDevice{
-				ID: id,
+				ID: testBlockDeviceID,
 			},
 			BlockDrive: &config.BlockDrive{
 				PCIPath: testPCIPath,
 			},
+		},
+		&drivers.GenericDevice{
+			ID: testCharacterDeviceId,
 		},
 	}
 
@@ -503,10 +508,16 @@ func TestAppendDevices(t *testing.T) {
 			config:     sandboxConfig,
 		},
 	}
-	c.devices = append(c.devices, ContainerDevice{
-		ID:            id,
-		ContainerPath: testBlockDeviceCtrPath,
-	})
+	c.devices = append(
+		c.devices,
+		ContainerDevice{
+			ID:            testBlockDeviceID,
+			ContainerPath: testBlockDeviceCtrPath,
+		},
+		ContainerDevice{
+			ID: testCharacterDeviceId,
+		},
+	)
 
 	devList := []*pb.Device{}
 	expected := []*pb.Device{
@@ -1190,4 +1201,20 @@ func TestKataAgentDirs(t *testing.T) {
 	cid := "123"
 	expected := "/rafs/123/lowerdir"
 	assert.Equal(rafsMountPath(cid), expected)
+}
+
+func TestIsNydusRootFSType(t *testing.T) {
+	testCases := map[string]bool{
+		"nydus":                               false,
+		"nydus-overlayfs":                     false,
+		"fuse.nydus-overlayfs":                true,
+		"fuse./usr/local/bin/nydus-overlayfs": true,
+		"fuse.nydus-overlayfs-e0ae398a2":      true,
+	}
+
+	for test, exp := range testCases {
+		t.Run(test, func(t *testing.T) {
+			assert.Equal(t, exp, IsNydusRootFSType(test))
+		})
+	}
 }

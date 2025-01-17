@@ -19,7 +19,6 @@ use ch_config::ch_api::{
 };
 use ch_config::{guest_protection_is_tdx, NamedHypervisorConfig, VmConfig};
 use core::future::poll_fn;
-use futures::executor::block_on;
 use futures::future::join_all;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
 use kata_types::capabilities::{Capabilities, CapabilityBits};
@@ -30,19 +29,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::fs;
 use std::fs::create_dir_all;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, RwLock};
-use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 use tokio::sync::watch::Receiver;
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio::{io::AsyncBufReadExt, sync::mpsc};
 
 const CH_NAME: &str = "cloud-hypervisor";
 
@@ -409,7 +409,13 @@ impl CloudHypervisorInner {
             .map_err(|e| anyhow!(e))?
             .clone();
 
-        let ch_outputlogger_task = tokio::spawn(cloud_hypervisor_log_output(child, shutdown));
+        let exit_notify: mpsc::Sender<i32> = self
+            .exit_notify
+            .take()
+            .ok_or_else(|| anyhow!("no exit notify"))?;
+
+        let ch_outputlogger_task =
+            tokio::spawn(cloud_hypervisor_log_output(child, shutdown, exit_notify));
 
         let tasks = vec![ch_outputlogger_task];
 
@@ -633,7 +639,7 @@ impl CloudHypervisorInner {
         Ok(())
     }
 
-    pub(crate) fn stop_vm(&mut self) -> Result<()> {
+    pub(crate) async fn stop_vm(&mut self) -> Result<()> {
         // If the container workload exits, this method gets called. However,
         // the container manager always makes a ShutdownContainer request,
         // which results in this method being called potentially a second
@@ -645,9 +651,14 @@ impl CloudHypervisorInner {
 
         self.state = VmmState::NotReady;
 
-        block_on(self.cloud_hypervisor_shutdown()).map_err(|e| anyhow!(e))?;
+        self.cloud_hypervisor_shutdown().await?;
 
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn wait_vm(&self) -> Result<i32> {
+        Ok(0)
     }
 
     pub(crate) fn pause_vm(&self) -> Result<()> {
@@ -677,13 +688,10 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
-        let mut vcpus = HashMap::new();
-
-        let vcpu = 0;
         let thread_id = self.get_vmm_master_tid().await?;
+        let proc_path = format!("/proc/{thread_id}");
 
-        vcpus.insert(vcpu, thread_id);
-
+        let vcpus = get_ch_vcpu_tids(&proc_path)?;
         let vcpu_thread_ids = VcpuThreadIds { vcpus };
 
         Ok(vcpu_thread_ids)
@@ -780,7 +788,11 @@ impl CloudHypervisorInner {
 // Log all output from the CH process until a shutdown signal is received.
 // When that happens, stop logging and wait for the child process to finish
 // before returning.
-async fn cloud_hypervisor_log_output(mut child: Child, mut shutdown: Receiver<bool>) -> Result<()> {
+async fn cloud_hypervisor_log_output(
+    mut child: Child,
+    mut shutdown: Receiver<bool>,
+    exit_notify: mpsc::Sender<i32>,
+) -> Result<()> {
     let stdout = child
         .stdout
         .as_mut()
@@ -835,7 +847,10 @@ async fn cloud_hypervisor_log_output(mut child: Child, mut shutdown: Receiver<bo
     }
 
     // Note that this kills _and_ waits for the process!
-    child.kill().await?;
+    let _ = child.kill().await;
+    if let Ok(status) = child.wait().await {
+        let _ = exit_notify.try_send(status.code().unwrap_or(0));
+    }
 
     Ok(())
 }
@@ -908,6 +923,59 @@ fn get_guest_protection() -> Result<GuestProtection> {
     Ok(guest_protection)
 }
 
+// Return a TID/VCPU map from a specified /proc/{pid} path.
+fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
+    const VCPU_STR: &str = "vcpu";
+
+    let src = std::fs::canonicalize(proc_path)
+        .map_err(|e| anyhow!("Invalid proc path: {proc_path}: {e}"))?;
+
+    let tid_path = src.join("task");
+
+    let mut vcpus = HashMap::new();
+
+    for entry in fs::read_dir(&tid_path)? {
+        let entry = entry?;
+
+        let tid_str = match entry.file_name().into_string() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+
+        let tid = tid_str
+            .parse::<u32>()
+            .map_err(|e| anyhow!(e).context("invalid tid."))?;
+
+        let comm_path = tid_path.join(tid_str.clone()).join("comm");
+
+        if !comm_path.exists() {
+            return Err(anyhow!("comm path was not found."));
+        }
+
+        let p_name = fs::read_to_string(comm_path)?;
+
+        // The CH names it's threads with a vcpu${number} to identify them, where
+        // the thread name is located at /proc/${ch_pid}/task/${thread_id}/comm.
+        if !p_name.starts_with(VCPU_STR) {
+            continue;
+        }
+
+        let vcpu_id = p_name
+            .trim_start_matches(VCPU_STR)
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| anyhow!(e).context("Invalid vcpu id."))?;
+
+        vcpus.insert(tid, vcpu_id);
+    }
+
+    if vcpus.is_empty() {
+        return Err(anyhow!("The contents of proc path are not available."));
+    }
+
+    Ok(vcpus)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,6 +989,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use std::path::PathBuf;
     use test_utils::{assert_result, skip_if_not_root};
+
+    use std::fs::File;
+    use tempdir::TempDir;
 
     fn set_fake_guest_protection(protection: Option<GuestProtection>) {
         let existing_ref = FAKE_GUEST_PROTECTION.clone();
@@ -1331,6 +1402,60 @@ mod tests {
             }
 
             assert_eq!(d.level, level, "{}", msg);
+        }
+    }
+
+    #[actix_rt::test]
+    async fn test_get_thread_ids() {
+        let path_dir = "/tmp/proc";
+        let file_name = "1";
+
+        let tmp_dir = TempDir::new(path_dir).unwrap();
+        let file_path = tmp_dir.path().join(file_name);
+        let _tmp_file = File::create(file_path.as_os_str()).unwrap();
+        let file_path_name = file_path.as_path().to_str().map(|s| s.to_string());
+        let file_path_name_str = file_path_name.as_ref().unwrap().to_string();
+
+        #[derive(Debug)]
+        struct TestData<'a> {
+            proc_path: &'a str,
+            result: Result<HashMap<u32, u32>>,
+        }
+
+        let tests = &[
+            TestData {
+                // Test on a non-existent directory.
+                proc_path: path_dir,
+                result: Err(anyhow!(
+                    "Invalid proc path: {path_dir}: No such file or directory (os error 2)"
+                )),
+            },
+            TestData {
+                // Test on an existing path, however it is not valid because it does not point to a pid.
+                proc_path: &file_path_name_str,
+                result: Err(anyhow!("Not a directory (os error 20)")),
+            },
+            TestData {
+                // Test on an existing proc/${pid} but that does not correspond to a CH pid.
+                proc_path: "/proc/1",
+                result: Err(anyhow!("The contents of proc path are not available.")),
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test: [{}]: {:?}", i, d);
+
+            if std::env::var("DEBUG").is_ok() {
+                println!("DEBUG: {msg}");
+            }
+
+            let result = get_ch_vcpu_tids(d.proc_path);
+            let msg = format!("{}, result: {:?}", msg, result);
+
+            let expected_error = format!("{}", d.result.as_ref().unwrap_err());
+            let actual_error = format!("{}", result.unwrap_err());
+
+            assert!(actual_error == expected_error, "{}", msg);
         }
     }
 }

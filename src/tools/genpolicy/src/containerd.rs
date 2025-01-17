@@ -32,7 +32,7 @@ pub fn get_process(privileged_container: bool, common: &policy::CommonData) -> p
         Env: Vec::new(),
         Cwd: "/".to_string(),
         Capabilities: capabilities,
-        NoNewPrivileges: true,
+        NoNewPrivileges: false,
     }
 }
 
@@ -152,12 +152,21 @@ pub fn get_linux(privileged_container: bool) -> policy::KataLinux {
                 "/proc/sys".to_string(),
                 "/proc/sysrq-trigger".to_string(),
             ],
+            Devices: vec![],
         }
     } else {
         policy::KataLinux {
             Namespaces: vec![],
             MaskedPaths: vec![],
             ReadonlyPaths: vec![],
+            Devices: vec![],
         }
     }
+}
+
+pub fn get_default_unix_env(env: &mut Vec<String>) {
+    assert!(env.is_empty());
+
+    // Return the value of defaultUnixEnv from containerd.
+    env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
 }

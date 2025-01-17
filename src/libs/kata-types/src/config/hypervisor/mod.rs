@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::io::{self, Result};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use sysinfo::{System, SystemExt};
+use sysinfo::System;
 
 mod dragonball;
 pub use self::dragonball::{DragonballConfig, HYPERVISOR_NAME_DRAGONBALL};
@@ -44,15 +44,27 @@ pub use self::qemu::{QemuConfig, HYPERVISOR_NAME_QEMU};
 mod ch;
 pub use self::ch::{CloudHypervisorConfig, HYPERVISOR_NAME_CH};
 
+mod remote;
+pub use self::remote::{RemoteConfig, HYPERVISOR_NAME_REMOTE};
+
 /// Virtual PCI block device driver.
 pub const VIRTIO_BLK_PCI: &str = "virtio-blk-pci";
 
 /// Virtual MMIO block device driver.
 pub const VIRTIO_BLK_MMIO: &str = "virtio-blk-mmio";
 
-const VIRTIO_BLK_CCW: &str = "virtio-blk-ccw";
-const VIRTIO_SCSI: &str = "virtio-scsi";
-const VIRTIO_PMEM: &str = "virtio-pmem";
+/// Virtual CCW block device driver.
+pub const VIRTIO_BLK_CCW: &str = "virtio-blk-ccw";
+
+/// Virtual SCSI block device driver.
+pub const VIRTIO_SCSI: &str = "virtio-scsi";
+
+/// Virtual PMEM device driver.
+pub const VIRTIO_PMEM: &str = "virtio-pmem";
+
+mod firecracker;
+pub use self::firecracker::{FirecrackerConfig, HYPERVISOR_NAME_FIRECRACKER};
+
 const VIRTIO_9P: &str = "virtio-9p";
 const VIRTIO_FS: &str = "virtio-fs";
 const VIRTIO_FS_INLINE: &str = "inline-virtio-fs";
@@ -405,6 +417,20 @@ pub struct DebugInfo {
     /// much disk space.
     #[serde(default)]
     pub guest_memory_dump_path: String,
+
+    /// This option allows to add a debug monitor socket when `enable_debug = true`
+    /// WARNING: Anyone with access to the monitor socket can take full control of
+    /// Qemu. This is for debugging purpose only and must *NEVER* be used in
+    /// production.
+    /// Valid values are :
+    /// - "hmp"
+    /// - "qmp"
+    /// - "qmp-pretty" (same as "qmp" with pretty json formatting)
+    /// If set to the empty string "", no debug monitor socket is added. This is
+    /// the default.
+    /// dbg_monitor_socket = "hmp"
+    #[serde(default)]
+    pub dbg_monitor_socket: String,
 }
 
 impl DebugInfo {
@@ -468,6 +494,12 @@ pub struct DeviceInfo {
     /// Enabling this will result in the VM device having iommu_platform=on set
     #[serde(default)]
     pub enable_iommu_platform: bool,
+
+    /// Enable balloon f_reporting, default false
+    ///
+    /// Enabling this will result in the VM balloon device having f_reporting=on set
+    #[serde(default)]
+    pub enable_balloon_f_reporting: bool,
 }
 
 impl DeviceInfo {
@@ -510,6 +542,8 @@ impl TopologyConfigInfo {
             HYPERVISOR_NAME_QEMU,
             HYPERVISOR_NAME_CH,
             HYPERVISOR_NAME_DRAGONBALL,
+            HYPERVISOR_NAME_FIRECRACKER,
+            HYPERVISOR_NAME_REMOTE,
         ];
         let hypervisor_name = toml_config.runtime.hypervisor_name.as_str();
         if !hypervisor_names.contains(&hypervisor_name) {
@@ -1010,6 +1044,18 @@ impl SharedFsInfo {
     }
 }
 
+/// Configuration information for remote hypervisor type.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RemoteInfo {
+    /// Remote hypervisor socket path
+    #[serde(default)]
+    pub hypervisor_socket: String,
+
+    /// Remote hyperisor timeout of creating (in seconds)
+    #[serde(default)]
+    pub hypervisor_timeout: i32,
+}
+
 /// Common configuration information for hypervisors.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Hypervisor {
@@ -1093,6 +1139,10 @@ pub struct Hypervisor {
     #[serde(default, flatten)]
     pub shared_fs: SharedFsInfo,
 
+    /// Remote hypervisor configuration information.
+    #[serde(default, flatten)]
+    pub remote_info: RemoteInfo,
+
     /// A sandbox annotation used to specify prefetch_files.list host path container image
     /// being used, and runtime will pass it to Hypervisor to  search for corresponding
     /// prefetch list file:
@@ -1103,6 +1153,14 @@ pub struct Hypervisor {
     /// Vendor customized runtime configuration.
     #[serde(default, flatten)]
     pub vendor: HypervisorVendor,
+
+    /// Disable applying SELinux on the container process.
+    #[serde(default = "yes")]
+    pub disable_guest_selinux: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Hypervisor {
@@ -1126,6 +1184,10 @@ impl ConfigOps for Hypervisor {
     fn adjust_config(conf: &mut TomlConfig) -> Result<()> {
         HypervisorVendor::adjust_config(conf)?;
         let hypervisors: Vec<String> = conf.hypervisor.keys().cloned().collect();
+        info!(
+            sl!(),
+            "Adjusting hypervisor configuration {:?}", hypervisors
+        );
         for hypervisor in hypervisors.iter() {
             if let Some(plugin) = get_hypervisor_plugin(hypervisor) {
                 plugin.adjust_config(conf)?;

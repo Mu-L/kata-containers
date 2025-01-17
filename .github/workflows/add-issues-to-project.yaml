@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   add-new-issues-to-backlog:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Install hub
         run: |
@@ -33,7 +33,7 @@ jobs:
         run: |
           # Clone into a temporary directory to avoid overwriting
           # any existing github directory.
-          pushd $(mktemp -d) &>/dev/null
+          pushd "$(mktemp -d)" &>/dev/null
           git clone --single-branch --depth 1 "https://github.com/kata-containers/.github" && cd .github/scripts
           sudo install hub-util.sh /usr/local/bin
           popd &>/dev/null

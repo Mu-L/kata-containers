@@ -36,14 +36,28 @@ jobs:
           - clh
           - dragonball
           - qemu
+          - qemu-runtime-rs
           - stratovirt
+          - cloud-hypervisor
         instance-type:
           - small
           - normal
         include:
           - host_os: cbl-mariner
             vmm: clh
-    runs-on: ubuntu-latest
+            instance-type: small
+            genpolicy-pull-method: oci-distribution
+            auto-generate-policy: yes
+          - host_os: cbl-mariner
+            vmm: clh
+            instance-type: small
+            genpolicy-pull-method: containerd
+            auto-generate-policy: yes
+          - host_os: cbl-mariner
+            vmm: clh
+            instance-type: normal
+            auto-generate-policy: yes
+    runs-on: ubuntu-22.04
     env:
       DOCKER_REGISTRY: ${{ inputs.registry }}
       DOCKER_REPO: ${{ inputs.repo }}
@@ -54,6 +68,8 @@ jobs:
       KUBERNETES: "vanilla"
       USING_NFD: "false"
       K8S_TEST_HOST_TYPE: ${{ matrix.instance-type }}
+      GENPOLICY_PULL_METHOD: ${{ matrix.genpolicy-pull-method }}
+      AUTO_GENERATE_POLICY: ${{ matrix.auto-generate-policy }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,7 +83,7 @@ jobs:
           TARGET_BRANCH: ${{ inputs.target-branch }}
 
       - name: get-kata-tarball
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
           path: kata-artifacts
@@ -102,7 +118,7 @@ jobs:
       - name: Deploy Kata
         timeout-minutes: 10
         run: bash tests/integration/kubernetes/gha-run.sh deploy-kata-aks
-      
+
       - name: Run tests
         timeout-minutes: 60
         run: bash tests/integration/kubernetes/gha-run.sh run-tests

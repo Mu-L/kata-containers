@@ -15,6 +15,7 @@ package qemu
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -42,6 +43,12 @@ type Machine struct {
 const (
 	// MachineTypeMicrovm is the QEMU microvm machine type for amd64
 	MachineTypeMicrovm string = "microvm"
+)
+
+const (
+	// Well known vsock CID for host system.
+	// https://man7.org/linux/man-pages/man7/vsock.7.html
+	VsockHostCid uint64 = 2
 )
 
 // Device is the qemu device interface.
@@ -141,16 +148,9 @@ const (
 func isDimmSupported(config *Config) bool {
 	switch runtime.GOARCH {
 	case "amd64", "386", "ppc64le", "arm64":
-		if config != nil {
-			if config.Machine.Type == MachineTypeMicrovm {
-				// microvm does not support NUMA
-				return false
-			}
-			if config.Knobs.MemFDPrivate {
-				// TDX guests rely on MemFD Private, which
-				// does not have NUMA support yet
-				return false
-			}
+		if config != nil && config.Machine.Type == MachineTypeMicrovm {
+			// microvm does not support NUMA
+			return false
 		}
 		return true
 	default:
@@ -300,6 +300,10 @@ type Object struct {
 	// and UEFI program image.
 	FirmwareVolume string
 
+	// The path to the file containing the AMD SEV-SNP certificate chain
+	// (including VCEK/VLEK certificates).
+	SnpCertsPath string
+
 	// CBitPos is the location of the C-bit in a guest page table entry
 	// This is only relevant for sev-guest objects
 	CBitPos uint32
@@ -313,6 +317,9 @@ type Object struct {
 
 	// Prealloc enables memory preallocation
 	Prealloc bool
+
+	// QgsPort defines Intel Quote Generation Service port exposed from the host
+	QgsPort uint32
 }
 
 // Valid returns true if the Object structure is valid and complete.
@@ -323,7 +330,7 @@ func (object Object) Valid() bool {
 	case MemoryBackendEPC:
 		return object.ID != "" && object.Size != 0
 	case TDXGuest:
-		return object.ID != "" && object.File != "" && object.DeviceID != ""
+		return object.ID != "" && object.File != "" && object.DeviceID != "" && object.QgsPort != 0
 	case SEVGuest:
 		fallthrough
 	case SNPGuest:
@@ -369,20 +376,25 @@ func (object Object) QemuParams(config *Config) []string {
 		}
 
 	case TDXGuest:
-		objectParams = append(objectParams, string(object.Type))
-		objectParams = append(objectParams, "sept-ve-disable=on")
-		objectParams = append(objectParams, fmt.Sprintf("id=%s", object.ID))
-		if object.Debug {
-			objectParams = append(objectParams, "debug=on")
-		}
+		objectParams = append(objectParams, prepareTDXObject(object))
 		config.Bios = object.File
 	case SEVGuest:
-		fallthrough
+		objectParams = append(objectParams, string(object.Type))
+		objectParams = append(objectParams, fmt.Sprintf("id=%s", object.ID))
+		objectParams = append(objectParams, fmt.Sprintf("cbitpos=%d", object.CBitPos))
+		objectParams = append(objectParams, fmt.Sprintf("reduced-phys-bits=%d", object.ReducedPhysBits))
+
+		driveParams = append(driveParams, "if=pflash,format=raw,readonly=on")
+		driveParams = append(driveParams, fmt.Sprintf("file=%s", object.File))
 	case SNPGuest:
 		objectParams = append(objectParams, string(object.Type))
 		objectParams = append(objectParams, fmt.Sprintf("id=%s", object.ID))
 		objectParams = append(objectParams, fmt.Sprintf("cbitpos=%d", object.CBitPos))
 		objectParams = append(objectParams, fmt.Sprintf("reduced-phys-bits=%d", object.ReducedPhysBits))
+		objectParams = append(objectParams, "kernel-hashes=on")
+		if object.SnpCertsPath != "" {
+			objectParams = append(objectParams, fmt.Sprintf("certs-path=%s", object.SnpCertsPath))
+		}
 
 		driveParams = append(driveParams, "if=pflash,format=raw,readonly=on")
 		driveParams = append(driveParams, fmt.Sprintf("file=%s", object.File))
@@ -414,6 +426,62 @@ func (object Object) QemuParams(config *Config) []string {
 	}
 
 	return qemuParams
+}
+
+type SocketAddress struct {
+	Type string `json:"type"`
+	Cid  string `json:"cid"`
+	Port string `json:"port"`
+}
+
+type TdxQomObject struct {
+	QomType               string        `json:"qom-type"`
+	Id                    string        `json:"id"`
+	MrConfigId            string        `json:"mrconfigid,omitempty"`
+	MrOwner               string        `json:"mrowner,omitempty"`
+	MrOwnerConfig         string        `json:"mrownerconfig,omitempty"`
+	QuoteGenerationSocket SocketAddress `json:"quote-generation-socket,omitempty"`
+	Debug                 *bool         `json:"debug,omitempty"`
+}
+
+func (this *SocketAddress) String() string {
+	b, err := json.Marshal(*this)
+
+	if err != nil {
+		log.Fatalf("Unable to marshal SocketAddress object: %s", err.Error())
+		return ""
+	}
+
+	return string(b)
+}
+
+func (this *TdxQomObject) String() string {
+	b, err := json.Marshal(*this)
+
+	if err != nil {
+		log.Fatalf("Unable to marshal TDX QOM object: %s", err.Error())
+		return ""
+	}
+
+	return string(b)
+}
+
+func prepareTDXObject(object Object) string {
+	qgsSocket := SocketAddress{"vsock", fmt.Sprint(VsockHostCid), fmt.Sprint(object.QgsPort)}
+	tdxObject := TdxQomObject{
+		string(object.Type), // qom-type
+		object.ID,           // id
+		"",                  // mrconfigid
+		"",                  // mrowner
+		"",                  // mrownerconfig
+		qgsSocket,           // quote-generation-socket
+		nil}
+
+	if object.Debug {
+		*tdxObject.Debug = true
+	}
+
+	return tdxObject.String()
 }
 
 // Virtio9PMultidev filesystem behaviour to deal
@@ -1240,10 +1308,6 @@ func (blkdev BlockDevice) QemuParams(config *Config) []string {
 		deviceParams = append(deviceParams, s)
 	}
 	deviceParams = append(deviceParams, fmt.Sprintf("drive=%s", blkdev.ID))
-	if !blkdev.SCSI {
-		deviceParams = append(deviceParams, "scsi=off")
-	}
-
 	if !blkdev.WCE {
 		deviceParams = append(deviceParams, "config-wce=off")
 	}
@@ -2633,9 +2697,6 @@ type Knobs struct {
 	// NoGraphic completely disables graphic output.
 	NoGraphic bool
 
-	// Daemonize will turn the qemu process into a daemon
-	Daemonize bool
-
 	// Both HugePages and MemPrealloc require the Memory.Size of the VM
 	// to be set, as they need to reserve the memory upfront in order
 	// for the VM to boot without errors.
@@ -2648,9 +2709,6 @@ type Knobs struct {
 
 	// MemPrealloc will allocate all the RAM upfront
 	MemPrealloc bool
-
-	// Private Memory FD meant for private memory map/unmap.
-	MemFDPrivate bool
 
 	// FileBackedMem requires Memory.Size and Memory.Path of the VM to
 	// be set.
@@ -2668,9 +2726,6 @@ type Knobs struct {
 	// Exit instead of rebooting
 	// Prevents QEMU from rebooting in the event of a Triple Fault.
 	NoReboot bool
-
-	// Don’t exit QEMU on guest shutdown, but instead only stop the emulation.
-	NoShutdown bool
 
 	// IOMMUPlatform will enable IOMMU for supported devices
 	IOMMUPlatform bool
@@ -2782,6 +2837,8 @@ type Config struct {
 	PidFile string
 
 	qemuParams []string
+
+	Debug bool
 }
 
 // appendFDs appends a list of arbitrary file descriptors to the qemu configuration and
@@ -2818,8 +2875,15 @@ func (config *Config) appendSeccompSandbox() {
 
 func (config *Config) appendName() {
 	if config.Name != "" {
+		var nameParams []string
+		nameParams = append(nameParams, config.Name)
+
+		if config.Debug {
+			nameParams = append(nameParams, "debug-threads=on")
+		}
+
 		config.qemuParams = append(config.qemuParams, "-name")
-		config.qemuParams = append(config.qemuParams, config.Name)
+		config.qemuParams = append(config.qemuParams, strings.Join(nameParams, ","))
 	}
 }
 
@@ -3017,13 +3081,10 @@ func (config *Config) appendMemoryKnobs() {
 		return
 	}
 	var objMemParam, numaMemParam string
-
 	dimmName := "dimm1"
 	if config.Knobs.HugePages {
 		objMemParam = "memory-backend-file,id=" + dimmName + ",size=" + config.Memory.Size + ",mem-path=/dev/hugepages"
 		numaMemParam = "node,memdev=" + dimmName
-	} else if config.Knobs.MemFDPrivate {
-		objMemParam = "memory-backend-memfd-private,id=" + dimmName + ",size=" + config.Memory.Size
 	} else if config.Knobs.FileBackedMem && config.Memory.Path != "" {
 		objMemParam = "memory-backend-file,id=" + dimmName + ",size=" + config.Memory.Size + ",mem-path=" + config.Memory.Path
 		numaMemParam = "node,memdev=" + dimmName
@@ -3065,14 +3126,6 @@ func (config *Config) appendKnobs() {
 
 	if config.Knobs.NoReboot {
 		config.qemuParams = append(config.qemuParams, "--no-reboot")
-	}
-
-	if config.Knobs.NoShutdown {
-		config.qemuParams = append(config.qemuParams, "--no-shutdown")
-	}
-
-	if config.Knobs.Daemonize {
-		config.qemuParams = append(config.qemuParams, "-daemonize")
 	}
 
 	config.appendMemoryKnobs()

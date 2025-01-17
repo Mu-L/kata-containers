@@ -7,6 +7,7 @@ use log::{debug, info};
 
 mod config_map;
 mod containerd;
+mod cronjob;
 mod daemon_set;
 mod deployment;
 mod job;
@@ -19,6 +20,7 @@ mod pod;
 mod pod_template;
 mod policy;
 mod registry;
+mod registry_containerd;
 mod replica_set;
 mod replication_controller;
 mod secret;
@@ -26,6 +28,7 @@ mod settings;
 mod stateful_set;
 mod utils;
 mod verity;
+mod version;
 mod volume;
 mod yaml;
 
@@ -33,6 +36,16 @@ mod yaml;
 async fn main() {
     env_logger::init();
     let config = utils::Config::new();
+
+    if config.version {
+        println!(
+            "Kata Containers policy tool (Rust): id: {}, version: {}, commit: {}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            version::COMMIT_INFO
+        );
+        return;
+    }
 
     debug!("Creating policy from yaml, settings, and rules.rego files...");
     let mut policy = policy::AgentPolicy::from_files(&config).await.unwrap();

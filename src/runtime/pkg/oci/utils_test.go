@@ -483,9 +483,6 @@ func TestAddAssetAnnotations(t *testing.T) {
 		vcAnnotations.HypervisorPath: fakeAssetFile,
 		vcAnnotations.HypervisorHash: "bbbbb",
 
-		vcAnnotations.HypervisorCtlPath: fakeAssetFile,
-		vcAnnotations.HypervisorCtlHash: "cc",
-
 		vcAnnotations.ImagePath: fakeAssetFile,
 		vcAnnotations.ImageHash: "52ss2550983",
 
@@ -533,7 +530,6 @@ func TestAddAssetAnnotations(t *testing.T) {
 	// Check that it works if all path lists are enabled
 	runtimeConfig.HypervisorConfig.HypervisorPathList = []string{tmpdirGlob}
 	runtimeConfig.HypervisorConfig.JailerPathList = []string{tmpdirGlob}
-	runtimeConfig.HypervisorConfig.HypervisorCtlPathList = []string{tmpdirGlob}
 
 	err = addAnnotations(ocispec, &config, runtimeConfig)
 	assert.NoError(err)
@@ -661,6 +657,8 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	ocispec.Annotations[vcAnnotations.DisableImageNvdimm] = "true"
 	ocispec.Annotations[vcAnnotations.ColdPlugVFIO] = config.BridgePort
 	ocispec.Annotations[vcAnnotations.HotPlugVFIO] = config.NoPort
+	ocispec.Annotations[vcAnnotations.PCIeRootPort] = "1"
+	ocispec.Annotations[vcAnnotations.PCIeSwitchPort] = "1"
 	ocispec.Annotations[vcAnnotations.IOMMUPlatform] = "true"
 	ocispec.Annotations[vcAnnotations.SGXEPC] = "64Mi"
 	ocispec.Annotations[vcAnnotations.UseLegacySerial] = "true"
@@ -701,6 +699,8 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	assert.Equal(sbConfig.HypervisorConfig.DisableImageNvdimm, true)
 	assert.Equal(string(sbConfig.HypervisorConfig.ColdPlugVFIO), string(config.BridgePort))
 	assert.Equal(string(sbConfig.HypervisorConfig.HotPlugVFIO), string(config.NoPort))
+	assert.Equal(sbConfig.HypervisorConfig.PCIeRootPort, uint32(1))
+	assert.Equal(sbConfig.HypervisorConfig.PCIeSwitchPort, uint32(1))
 	assert.Equal(sbConfig.HypervisorConfig.IOMMUPlatform, true)
 	assert.Equal(sbConfig.HypervisorConfig.SGXEPCSize, int64(67108864))
 	assert.Equal(sbConfig.HypervisorConfig.LegacySerial, true)
@@ -724,6 +724,74 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	ocispec.Annotations[vcAnnotations.DefaultMaxVCPUs] = "1"
 	ocispec.Annotations[vcAnnotations.DefaultMemory] = fmt.Sprintf("%d", vc.MinHypervisorMemory+1)
 	assert.Error(err)
+}
+
+func TestAddRemoteHypervisorAnnotations(t *testing.T) {
+	// Remote hypervisor uses DefaultVCPUs, DefaultMemory etc as annotations to pick the size of the separate VM to create,
+	// so doesn't need to be bound by the host's capacity limits.
+	assert := assert.New(t)
+
+	config := vc.SandboxConfig{
+		Annotations: make(map[string]string),
+	}
+
+	sbConfig := vc.SandboxConfig{
+		Annotations:    make(map[string]string),
+		HypervisorType: vc.RemoteHypervisor,
+	}
+
+	ocispec := specs.Spec{
+		Annotations: make(map[string]string),
+	}
+
+	runtimeConfig := RuntimeConfig{
+		HypervisorType: vc.RemoteHypervisor,
+	}
+
+	err := addAnnotations(ocispec, &config, runtimeConfig)
+	assert.NoError(err)
+	assert.Exactly(vc.HypervisorConfig{}, config.HypervisorConfig)
+
+	// Enable annotations
+	runtimeConfig.HypervisorConfig.EnableAnnotations = []string{".*"}
+
+	// When DefaultVCPUs is more than the number of cpus on the host, remote hypervisor annotations don't throw an error
+	ocispec.Annotations[vcAnnotations.DefaultVCPUs] = "2000"
+	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
+	assert.NoError(err)
+
+	// When DefaultMaxVCPUs is more than the number of cpus on the host, remote hypervisor annotations don't throw an error
+	ocispec.Annotations[vcAnnotations.DefaultMaxVCPUs] = "2000"
+	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
+	assert.NoError(err)
+
+	// When memory is smaller than the minimum Hypervisor memory, remote hypervisor annotations don't throw an error
+	ocispec.Annotations[vcAnnotations.DefaultMemory] = "1"
+	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
+	assert.NoError(err)
+
+	// When initdata specified, remote hypervisor annotations do have the annotation added.
+	ocispec.Annotations[vcAnnotations.Initdata] = "initdata"
+	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
+	assert.NoError(err)
+	assert.Equal(sbConfig.HypervisorConfig.Initdata, "initdata")
+
+	// When GPU annotations are specified, remote hypervisor annotations have the annotation added
+	ocispec.Annotations[vcAnnotations.DefaultGPUs] = "-1"
+	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
+	assert.Error(err)
+
+	ocispec.Annotations[vcAnnotations.DefaultGPUs] = "1"
+	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
+	assert.NoError(err)
+	assert.Equal(sbConfig.HypervisorConfig.DefaultGPUs, uint32(1))
+
+	// When GPU annotations are specified, remote hypervisor annotations have the annotation added
+	ocispec.Annotations[vcAnnotations.DefaultGPUModel] = "tesla"
+	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
+	assert.NoError(err)
+	assert.Equal(sbConfig.HypervisorConfig.DefaultGPUModel, "tesla")
+
 }
 
 func TestAddProtectedHypervisorAnnotations(t *testing.T) {
@@ -810,12 +878,16 @@ func TestAddRuntimeAnnotations(t *testing.T) {
 	ocispec.Annotations[vcAnnotations.SandboxCgroupOnly] = "true"
 	ocispec.Annotations[vcAnnotations.DisableNewNetNs] = "true"
 	ocispec.Annotations[vcAnnotations.InterNetworkModel] = "macvtap"
+	ocispec.Annotations[vcAnnotations.CreateContainerTimeout] = "100"
+	ocispec.Annotations[vcAnnotations.Initdata] = "initdata"
 
 	addAnnotations(ocispec, &config, runtimeConfig)
 	assert.Equal(config.DisableGuestSeccomp, true)
 	assert.Equal(config.SandboxCgroupOnly, true)
 	assert.Equal(config.NetworkConfig.DisableNewNetwork, true)
 	assert.Equal(config.NetworkConfig.InterworkingModel, vc.NetXConnectMacVtapModel)
+	assert.Equal(config.CreateContainerTimeout, uint64(100))
+	assert.Equal(config.HypervisorConfig.Initdata, "initdata")
 }
 
 func TestRegexpContains(t *testing.T) {
