@@ -29,16 +29,16 @@ TARGET_OS=${TARGET_OS:-linux}
 
 install_yq() {
 	pushd "${repo_root_dir}"
-	.ci/install_yq.sh
+	./ci/install_yq.sh
 	popd
 }
 
 get_from_kata_deps() {
-	local dependency="$1"
+  local dependency="$1 | explode(.)"
 	versions_file="${this_script_dir}/../../../versions.yaml"
 
 	command -v yq &>/dev/null || die 'yq command is not in your $PATH'
-	result=$("yq" read -X "$versions_file" "$dependency")
+	result=$("yq" "$dependency" "$versions_file")
 	[ "$result" = "null" ] && result=""
 	echo "$result"
 }
@@ -67,6 +67,7 @@ arch_to_golang()
 	case "$arch" in
 		aarch64) echo "arm64";;
 		ppc64le) echo "$arch";;
+		riscv64) echo "$arch";;
 		x86_64) echo "amd64";;
 		s390x) echo "s390x";;
 		*) die "unsupported architecture: $arch";;
@@ -107,13 +108,11 @@ get_last_modification() {
 	local file="${1}"
 
 	pushd ${repo_root_dir} &> /dev/null
-	# This is a workaround needed for when running this code on Jenkins
-	git config --global --add safe.directory ${repo_root_dir} &> /dev/null
 
 	dirty=""
 	[ $(git status --porcelain | grep "${file#${repo_root_dir}/}" | wc -l) -gt 0 ] && dirty="-dirty"
 
-	echo "$(git log -1 --pretty=format:"%h" ${file})${dirty}"
+	echo "$(git log -1 --abbrev=9 --pretty=format:"%h" ${file})${dirty}"
 	popd &> /dev/null
 }
 
@@ -180,12 +179,17 @@ get_qemu_image_name() {
 
 get_shim_v2_image_name() {
 	shim_v2_script_dir="${repo_root_dir}/tools/packaging/static-build/shim-v2"
-	echo "${BUILDER_REGISTRY}:shim-v2-go-$(get_from_kata_deps "languages.golang.meta.newest-version")-rust-$(get_from_kata_deps "languages.rust.meta.newest-version")-$(get_last_modification ${shim_v2_script_dir})-$(uname -m)"
+	echo "${BUILDER_REGISTRY}:shim-v2-go-$(get_from_kata_deps ".languages.golang.meta.newest-version")-rust-$(get_from_kata_deps ".languages.rust.meta.newest-version")-$(get_last_modification ${shim_v2_script_dir})-$(uname -m)"
 }
 
 get_ovmf_image_name() {
 	ovmf_script_dir="${repo_root_dir}/tools/packaging/static-build/ovmf"
 	echo "${BUILDER_REGISTRY}:ovmf-$(get_last_modification ${ovmf_script_dir})-$(uname -m)"
+}
+
+get_busybox_image_name() {
+	busybox_script_dir="${repo_root_dir}/tools/packaging/static-build/busybox"
+	echo "${BUILDER_REGISTRY}:busybox-$(get_last_modification "${busybox_script_dir}")-$(uname -m)"
 }
 
 get_virtiofsd_image_name() {
@@ -197,6 +201,9 @@ get_virtiofsd_image_name() {
 	        "ppc64le")
 	                libc="gnu"
 	                ;;
+	        "riscv64")
+	                libc="gnu"
+	                ;;
 	        "s390x")
 	                libc="gnu"
 	                ;;
@@ -206,15 +213,16 @@ get_virtiofsd_image_name() {
 	esac
 
 	virtiofsd_script_dir="${repo_root_dir}/tools/packaging/static-build/virtiofsd"
-	echo "${BUILDER_REGISTRY}:virtiofsd-$(get_from_kata_deps "externals.virtiofsd.toolchain")-${libc}-$(get_last_modification ${virtiofsd_script_dir})-$(uname -m)"
+	echo "${BUILDER_REGISTRY}:virtiofsd-$(get_from_kata_deps ".externals.virtiofsd.toolchain")-${libc}-$(get_last_modification ${virtiofsd_script_dir})-$(uname -m)"
 }
 
 get_tools_image_name() {
+	tools_script_dir="${repo_root_dir}/tools/packaging/static-build/tools"
 	tools_dir="${repo_root_dir}/src/tools"
 	libs_dir="${repo_root_dir}/src/libs"
 	agent_dir="${repo_root_dir}/src/agent"
 
-	echo "${BUILDER_REGISTRY}:tools-$(get_last_modification ${tools_dir})-$(get_last_modification ${libs_dir})-$(get_last_modification ${agent_dir})-$(uname -m)"
+	echo "${BUILDER_REGISTRY}:tools-$(get_last_modification ${tools_dir})-$(get_last_modification ${libs_dir})-$(get_last_modification ${agent_dir})-$(get_last_modification ${tools_script_dir})-$(uname -m)"
 }
 
 get_agent_image_name() {
@@ -222,11 +230,17 @@ get_agent_image_name() {
 		"$(get_last_modification "${repo_root_dir}/ci/install_libseccomp.sh")" \
 		"$(get_last_modification "${repo_root_dir}/tools/packaging/kata-deploy/local-build/kata-deploy-copy-libseccomp-installer.sh")")
 	agent_dir="${repo_root_dir}/tools/packaging/static-build/agent"
+	rust_toolchain="$(get_from_kata_deps ".languages.rust.meta.newest-version")"
 
-	echo "${BUILDER_REGISTRY}:agent-${libseccomp_hash}-$(get_last_modification ${agent_dir})-$(uname -m)"
+	echo "${BUILDER_REGISTRY}:agent-${libseccomp_hash}-$(get_last_modification ${agent_dir})-${rust_toolchain}-$(uname -m)"
 }
 
 get_coco_guest_components_image_name() {
 	coco_guest_components_script_dir="${repo_root_dir}/tools/packaging/static-build/coco-guest-components"
-	echo "${BUILDER_REGISTRY}:coco-guest-components-$(get_from_kata_deps "externals.coco-guest-components.toolchain")-$(get_last_modification ${coco_guest_components_script_dir})-$(uname -m)"
+	echo "${BUILDER_REGISTRY}:coco-guest-components-$(get_from_kata_deps ".externals.coco-guest-components.toolchain")-$(get_last_modification ${coco_guest_components_script_dir})-$(uname -m)"
+}
+
+get_pause_image_name() {
+	pause_image_script_dir="${repo_root_dir}/tools/packaging/static-build/pause-image"
+	echo "${BUILDER_REGISTRY}:pause-image-$(get_last_modification ${pause_image_script_dir})-$(uname -m)"
 }

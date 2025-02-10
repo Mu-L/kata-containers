@@ -188,36 +188,36 @@ EOF
 
 # Calls die() if the specified function is not valid.
 func_is_valid() {
-    local name="$1"
+	local name="$1"
 
-    type -t "$name" &>/dev/null || die "function '$name' does not exist"
+	type -t "$name" &>/dev/null || die "function '$name' does not exist"
 }
 
 # Calls die() if the specified function is not valid or not a check function.
 ensure_func_is_check_func() {
-    local name="$1"
+	local name="$1"
 
-    func_is_valid "$name"
+	func_is_valid "$name"
 
-    { echo "$name" | grep -q "${check_func_regex}"; ret=$?; }
+	{ echo "$name" | grep -q "${check_func_regex}"; ret=$?; }
 
-    [ "$ret" = 0 ] || die "function '$name' is not a check function"
+	[ "$ret" = 0 ] || die "function '$name' is not a check function"
 }
 
 # Returns "yes" if the specified function needs to run on all architectures,
 # else "no".
 func_is_arch_specific() {
-    local name="$1"
+	local name="$1"
 
-    ensure_func_is_check_func "$name"
+	ensure_func_is_check_func "$name"
 
-    { echo "$name" | grep -q "${arch_func_regex}"; ret=$?; }
+	{ echo "$name" | grep -q "${arch_func_regex}"; ret=$?; }
 
-    if [ "$ret" = 0 ]; then
-        echo "yes"
-    else
-        echo "no"
-    fi
+	if [ "$ret" = 0 ]; then
+		echo "yes"
+	else
+		echo "no"
+	fi
 }
 
 function remove_tmp_files() {
@@ -330,8 +330,6 @@ static_check_go_arch_specific()
 # Install yamllint in the different Linux distributions
 install_yamllint()
 {
-	source /etc/os-release || source /usr/lib/os-release
-
 	package="yamllint"
 
 	case "$ID" in
@@ -431,7 +429,7 @@ static_check_license_headers()
 
 		info "Checking $desc"
 
-		local missing=$(egrep \
+		local missing=$(grep \
 			--exclude=".git/*" \
 			--exclude=".gitignore" \
 			--exclude=".dockerignore" \
@@ -474,9 +472,10 @@ static_check_license_headers()
 			--exclude="tools/packaging/qemu/default-configs/*" \
 			--exclude="src/libs/protocols/protos/gogo/*.proto" \
 			--exclude="src/libs/protocols/protos/google/*.proto" \
+			--exclude="src/mem-agent/example/protocols/protos/google/protobuf/*.proto" \
 			--exclude="src/libs/*/test/texture/*" \
 			--exclude="*.dic" \
-			-EL $extra_args "\<${pattern}\>" \
+			-EL $extra_args -E "\<${pattern}\>" \
 			$files || true)
 
 		if [ -n "$missing" ]; then
@@ -784,7 +783,7 @@ static_check_docs()
 
 	local exclude_pattern
 
-	# Convert the list of files into an egrep(1) alternation pattern.
+	# Convert the list of files into an grep(1) alternation pattern.
 	exclude_pattern=$(echo "${exclude_doc_regexs[@]}"|sed 's, ,|,g')
 
 	# Every document in the repo (except a small handful of exceptions)
@@ -793,7 +792,7 @@ static_check_docs()
 	do
 		# Check the ignore list for markdown files that do not need to
 		# be referenced by others.
-		echo "$doc"|egrep -q "(${exclude_pattern})" && continue
+		echo "$doc"|grep -q -E "(${exclude_pattern})" && continue
 
 		grep -q "$doc" "$md_links" || die "Document $doc is not referenced"
 	done
@@ -828,7 +827,7 @@ static_check_docs()
 		if [ "$specific_branch" != "true" ]
 		then
 			# If the URL is new on this PR, it cannot be checked.
-			echo "$new_urls" | egrep -q "\<${url}\>" && \
+			echo "$new_urls" | grep -q -E "\<${url}\>" && \
 				info "ignoring new (but correct) URL: $url" && continue
 		fi
 
@@ -926,12 +925,12 @@ static_check_eof()
 	[ "$file" == "Vagrantfile" ] && return
 
 	local invalid=$(cat "$file" |\
-		egrep -o '<<-* *\w*' |\
+		grep -o -E '<<-* *\w*' |\
 		sed -e 's/^<<-*//g' |\
 		tr -d ' ' |\
 		sort -u |\
-		egrep -v '^$' |\
-		egrep -v "$anchor" || true)
+		grep -v -E '^$' |\
+		grep -v -E "$anchor" || true)
 	[ -z "$invalid" ] || die "Expected '$anchor' here anchor, in $file found: $invalid"
 }
 
@@ -958,7 +957,7 @@ static_check_files()
 	then
 		info "Checking all files in $branch branch"
 
-		files=$(git ls-files | egrep -v "/(.git|vendor|grpc-rs|target)/" || true)
+		files=$(git ls-files | grep -v -E "/(.git|vendor|grpc-rs|target)/" || true)
 	else
 		info "Checking local branch for changed files only"
 
@@ -980,7 +979,7 @@ static_check_files()
 
 		# Look for files containing the specified comment tags but
 		# which do not include a github URL.
-		match=$(egrep -H "\<FIXME\>|\<TODO\>" "$file" |\
+		match=$(grep -H -E "\<FIXME\>|\<TODO\>" "$file" |\
 			grep -v "https://github.com/.*/issues/[0-9]" |\
 			cut -d: -f1 |\
 			sort -u || true)
@@ -1295,7 +1294,7 @@ static_check_dockerfiles()
 	linter_cmd+=" --ignore DL3041"
 	# "DL3033 warning: Specify version with `yum install -y <package>-<version>`"
 	linter_cmd+=" --ignore DL3033"
-	# "DL3018 warning: Pin versions in apk add. Instead of `apk add <package>` use `apk add <package>=<version>`" 
+	# "DL3018 warning: Pin versions in apk add. Instead of `apk add <package>` use `apk add <package>=<version>`"
 	linter_cmd+=" --ignore DL3018"
 	# "DL3003 warning: Use WORKDIR to switch to a directory"
 	# See https://github.com/hadolint/hadolint/issues/70
@@ -1399,9 +1398,66 @@ run_or_list_check_function()
 	eval "$func"
 }
 
+setup()
+{
+	source /etc/os-release || source /usr/lib/os-release
+
+	trap remove_tmp_files EXIT
+}
+
+# Display a message showing some system details.
+announce()
+{
+	local arch
+	arch=$(uname -m)
+
+	local file='/proc/cpuinfo'
+
+	local detail
+	detail=$(grep -m 1 -E '\<vendor_id\>|\<cpu\> *	*:' "$file" \
+		2>/dev/null |\
+		cut -d: -f2- |\
+		tr -d ' ' || true)
+
+	local arch="$arch"
+
+	[ -n "$detail" ] && arch+=" ('$detail')"
+
+	local kernel
+	kernel=$(uname -r)
+
+	local distro_name
+	local distro_version
+
+	distro_name="${NAME:-}"
+	distro_version="${VERSION:-}"
+
+	local -a lines
+
+	local IFS=$'\n'
+
+    lines=( $(cat <<-EOF
+	Running static checks:
+	  script: $script_name
+	  architecture: $arch
+	  kernel: $kernel
+	  distro:
+	    name: $distro_name
+	    version: $distro_version
+	EOF
+	))
+
+	local line
+
+	for line in "${lines[@]}"
+	do
+		info "$line"
+	done
+}
+
 main()
 {
-	trap remove_tmp_files EXIT
+	setup
 
 	local long_option_names="${!long_options[@]}"
 
@@ -1476,6 +1532,8 @@ main()
 	fi
 
 	repo_path=$GOPATH/src/$repo
+
+	announce
 
 	local all_check_funcs=$(typeset -F|awk '{print $3}'|grep "${check_func_regex}"|sort)
 

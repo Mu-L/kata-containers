@@ -281,7 +281,6 @@ func TestAppendDeviceBlock(t *testing.T) {
 		AIO:           Threads,
 		Format:        QCOW2,
 		Interface:     NoInterface,
-		SCSI:          false,
 		WCE:           false,
 		DisableModern: true,
 		ROMFile:       romfile,
@@ -445,13 +444,12 @@ func TestAppendEmptyDevice(t *testing.T) {
 }
 
 func TestAppendKnobsAllTrue(t *testing.T) {
-	var knobsString = "-no-user-config -nodefaults -nographic --no-reboot -daemonize -overcommit mem-lock=on -S"
+	var knobsString = "-no-user-config -nodefaults -nographic --no-reboot -overcommit mem-lock=on -S"
 	knobs := Knobs{
 		NoUserConfig:  true,
 		NoDefaults:    true,
 		NoGraphic:     true,
 		NoReboot:      true,
-		Daemonize:     true,
 		MemPrealloc:   true,
 		FileBackedMem: true,
 		MemShared:     true,
@@ -628,29 +626,6 @@ func TestAppendMemoryFileBackedMemPrealloc(t *testing.T) {
 	} else {
 		knobsString += memBackendString
 	}
-
-	testConfigAppend(conf, knobs, memString+" "+knobsString, t)
-}
-
-func TestAppendMemoryBackedMemFdPrivate(t *testing.T) {
-	conf := &Config{
-		Memory: Memory{
-			Size:  "1G",
-			Slots: 8,
-		},
-	}
-	memString := "-m 1G,slots=8"
-	testConfigAppend(conf, conf.Memory, memString, t)
-
-	knobs := Knobs{
-		MemFDPrivate: true,
-		MemShared:    false,
-	}
-	objMemString := "-object memory-backend-memfd-private,id=dimm1,size=1G"
-	memBackendString := "-machine memory-backend=dimm1"
-
-	knobsString := objMemString + " "
-	knobsString += memBackendString
 
 	testConfigAppend(conf, knobs, memString+" "+knobsString, t)
 }

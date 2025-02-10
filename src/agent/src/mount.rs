@@ -180,7 +180,7 @@ pub fn get_mount_fs_type_from_file(mount_file: &str, mount_point: &str) -> Resul
     let re = Regex::new(format!("device .+ mounted on {} with fstype (.+)", mount_point).as_str())?;
 
     // Read the file line by line using the lines() iterator from std::io::BufRead.
-    for (_index, line) in content.lines().enumerate() {
+    for line in content.lines() {
         if let Some(capes) = re.captures(line) {
             if capes.len() > 1 {
                 return Ok(capes[1].to_string());
@@ -225,7 +225,7 @@ pub fn get_cgroup_mounts(
 
     // #subsys_name    hierarchy       num_cgroups     enabled
     // fields[0]       fields[1]       fields[2]       fields[3]
-    'outer: for (_, line) in reader.lines().enumerate() {
+    'outer: for line in reader.lines() {
         let line = line?;
 
         let fields: Vec<&str> = line.split('\t').collect();
@@ -299,7 +299,13 @@ pub fn cgroups_mount(logger: &Logger, unified_cgroup_hierarchy: bool) -> Result<
 
     // Enable memory hierarchical account.
     // For more information see https://www.kernel.org/doc/Documentation/cgroup-v1/memory.txt
-    online_device("/sys/fs/cgroup/memory/memory.use_hierarchy")
+    // cgroupsV2 will automatically enable memory.use_hierarchy.
+    // additinoally this directory layout is not present in cgroupsV2.
+    if !unified_cgroup_hierarchy {
+        return online_device("/sys/fs/cgroup/memory/memory.use_hierarchy");
+    }
+
+    Ok(())
 }
 
 #[instrument]
@@ -531,6 +537,7 @@ mod tests {
 
         OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(test_file_filename)
             .expect("failed to create test file");

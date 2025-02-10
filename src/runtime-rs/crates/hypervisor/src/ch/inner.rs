@@ -15,9 +15,9 @@ use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
 use persist::sandbox_persist::Persist;
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
-use tokio::process::Child;
 use tokio::sync::watch::{channel, Receiver, Sender};
 use tokio::task::JoinHandle;
+use tokio::{process::Child, sync::mpsc};
 
 #[derive(Debug)]
 pub struct CloudHypervisorInner {
@@ -76,12 +76,14 @@ pub struct CloudHypervisorInner {
 
     /// Size of memory block of guest OS in MB (currently unused)
     pub(crate) _guest_memory_block_size_mb: u32,
+
+    pub(crate) exit_notify: Option<mpsc::Sender<i32>>,
 }
 
 const CH_DEFAULT_TIMEOUT_SECS: u32 = 10;
 
 impl CloudHypervisorInner {
-    pub fn new() -> Self {
+    pub fn new(exit_notify: Option<mpsc::Sender<i32>>) -> Self {
         let mut capabilities = Capabilities::new();
         capabilities.set(
             CapabilityBits::BlockDeviceSupport
@@ -116,6 +118,8 @@ impl CloudHypervisorInner {
             guest_protection_to_use: GuestProtection::NoProtection,
             ch_features: None,
             _guest_memory_block_size_mb: 0,
+
+            exit_notify,
         }
     }
 
@@ -130,14 +134,14 @@ impl CloudHypervisorInner {
 
 impl Default for CloudHypervisorInner {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 #[async_trait]
 impl Persist for CloudHypervisorInner {
     type State = HypervisorState;
-    type ConstructorArgs = ();
+    type ConstructorArgs = mpsc::Sender<i32>;
 
     // Return a state object that will be saved by the caller.
     async fn save(&self) -> Result<Self::State> {
@@ -147,29 +151,87 @@ impl Persist for CloudHypervisorInner {
             vm_path: self.vm_path.clone(),
             jailed: false,
             jailer_root: String::default(),
-            netns: None,
+            netns: self.netns.clone(),
             config: self.hypervisor_config(),
             run_dir: self.run_dir.clone(),
-            cached_block_devices: Default::default(),
+            guest_protection_to_use: self.guest_protection_to_use.clone(),
+
             ..Default::default()
         })
     }
 
     // Set the hypervisor state to the specified state
     async fn restore(
-        _hypervisor_args: Self::ConstructorArgs,
+        exit_notify: mpsc::Sender<i32>,
         hypervisor_state: Self::State,
     ) -> Result<Self> {
-        let ch = Self {
+        let (tx, rx) = channel(true);
+
+        let mut ch = Self {
             config: Some(hypervisor_state.config),
             state: VmmState::NotReady,
             id: hypervisor_state.id,
             vm_path: hypervisor_state.vm_path,
             run_dir: hypervisor_state.run_dir,
+            netns: hypervisor_state.netns,
+            guest_protection_to_use: hypervisor_state.guest_protection_to_use.clone(),
+
+            pending_devices: vec![],
+            device_ids: HashMap::<String, String>::new(),
+            tasks: None,
+            shutdown_tx: Some(tx),
+            shutdown_rx: Some(rx),
+            timeout_secs: CH_DEFAULT_TIMEOUT_SECS as i32,
+            jailer_root: String::default(),
+            ch_features: None,
+            exit_notify: Some(exit_notify),
 
             ..Default::default()
         };
+        ch._capabilities = ch.capabilities().await?;
 
         Ok(ch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kata_sys_util::protection::TDXDetails;
+
+    #[actix_rt::test]
+    async fn test_save_clh() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+
+        let mut clh = CloudHypervisorInner::new(Some(exit_notify.clone()));
+        clh.id = String::from("123456");
+        clh.netns = Some(String::from("/var/run/netns/testnet"));
+        clh.vm_path = String::from("/opt/kata/bin/cloud-hypervisor");
+        clh.run_dir = String::from("/var/run/kata-containers/") + &clh.id;
+
+        let details = TDXDetails {
+            major_version: 1,
+            minor_version: 0,
+        };
+
+        clh.guest_protection_to_use = GuestProtection::Tdx(details);
+
+        let state = clh.save().await.unwrap();
+        assert_eq!(state.id, clh.id);
+        assert_eq!(state.netns, clh.netns);
+        assert_eq!(state.vm_path, clh.vm_path);
+        assert_eq!(state.run_dir, clh.run_dir);
+        assert_eq!(state.guest_protection_to_use, clh.guest_protection_to_use);
+        assert!(!state.jailed);
+        assert_eq!(state.hypervisor_type, HYPERVISOR_NAME_CH.to_string());
+
+        let clh = CloudHypervisorInner::restore(exit_notify, state.clone())
+            .await
+            .unwrap();
+        assert_eq!(clh.id, state.id);
+        assert_eq!(clh.netns, state.netns);
+        assert_eq!(clh.vm_path, state.vm_path);
+        assert_eq!(clh.run_dir, state.run_dir);
+        assert_eq!(clh.guest_protection_to_use, state.guest_protection_to_use);
     }
 }

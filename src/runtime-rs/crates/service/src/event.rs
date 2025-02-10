@@ -18,9 +18,6 @@ use containerd_shim_protos::shim::events;
 use containerd_shim_protos::shim_async::Events;
 use ttrpc::MessageHeader;
 
-const REMOTE_FORWARDER: &str = "remote";
-const LOG_FORWARDER: &str = "log";
-
 // Ttrpc address passed from container runtime.
 // For now containerd will pass the address, and CRI-O will not.
 const TTRPC_ADDRESS_ENV: &str = "TTRPC_ADDRESS";
@@ -30,20 +27,20 @@ const TTRPC_ADDRESS_ENV: &str = "TTRPC_ADDRESS";
 pub(crate) trait Forwarder {
     /// Forward an event to publisher
     async fn forward(&self, event: Arc<dyn Event + Send + Sync>) -> Result<()>;
-    /// Get forwarder type
-    async fn r#type(&self) -> String;
 }
 
 /// Returns an instance of `ContainerdForwarder` in the case of
 /// `TTRPC_ADDRESS` existing. Otherwise, fall back to `LogForwarder`.
 pub(crate) async fn new_event_publisher(namespace: &str) -> Result<Box<dyn Forwarder>> {
     let fwd: Box<dyn Forwarder> = match env::var(TTRPC_ADDRESS_ENV) {
-        Ok(address) => Box::new(
+        Ok(address) if !address.is_empty() => Box::new(
             ContainerdForwarder::new(namespace, &address)
                 .await
                 .context("new containerd forwarder")?,
         ),
-        Err(_) => Box::new(
+        // an empty address doesn't match the arm above so catch it here
+        // and handle it the same way as if it's missing altogether
+        Ok(_) | Err(_) => Box::new(
             LogForwarder::new(namespace)
                 .await
                 .context("new log forwarder")?,
@@ -105,10 +102,6 @@ impl Forwarder for ContainerdForwarder {
             .context("forward")?;
         Ok(())
     }
-
-    async fn r#type(&self) -> String {
-        REMOTE_FORWARDER.to_string()
-    }
 }
 
 /// Events are writen into logs.
@@ -138,10 +131,6 @@ impl Forwarder for LogForwarder {
             event
         );
         Ok(())
-    }
-
-    async fn r#type(&self) -> String {
-        LOG_FORWARDER.to_string()
     }
 }
 

@@ -182,6 +182,10 @@ type SandboxConfig struct {
 
 	// EnableVCPUsPinning controls whether each vCPU thread should be scheduled to a fixed CPU
 	EnableVCPUsPinning bool
+
+	// Create container timeout which, if provided, indicates the create container timeout
+	// needed for the workload(s)
+	CreateContainerTimeout uint64
 }
 
 // valid checks that the sandbox configuration is valid.
@@ -244,6 +248,11 @@ type Sandbox struct {
 	seccompSupported  bool
 	disableVMShutdown bool
 	isVCPUsPinningOn  bool
+
+	// hotplugNetworkConfigApplied prevents network config API being called
+	// multiple times for hot-plugged network device when Sandbox has multiple
+	// containers.
+	hotplugNetworkConfigApplied bool
 }
 
 // ID returns the sandbox identifier string.
@@ -444,13 +453,25 @@ func createAssets(ctx context.Context, sandboxConfig *SandboxConfig) error {
 	defer span.End()
 
 	for _, name := range types.AssetTypes() {
-		a, err := types.NewAsset(sandboxConfig.Annotations, name)
+		annotation, _, err := name.Annotations()
 		if err != nil {
 			return err
 		}
+		// For remote hypervisor donot check for Absolute Path incase of ImagePath, as it denotes the name of the image.
+		if sandboxConfig.HypervisorType == RemoteHypervisor && annotation == annotations.ImagePath {
+			value := sandboxConfig.Annotations[annotation]
+			if value != "" {
+				sandboxConfig.HypervisorConfig.ImagePath = value
+			}
+		} else {
+			a, err := types.NewAsset(sandboxConfig.Annotations, name)
+			if err != nil {
+				return err
+			}
 
-		if err := sandboxConfig.HypervisorConfig.AddCustomAsset(a); err != nil {
-			return err
+			if err := sandboxConfig.HypervisorConfig.AddCustomAsset(a); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -668,64 +689,6 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 	return s, nil
 }
 
-func (s *Sandbox) coldOrHotPlugVFIO(sandboxConfig *SandboxConfig) (bool, error) {
-	// If we have a confidential guest we need to cold-plug the PCIe VFIO devices
-	// until we have TDISP/IDE PCIe support.
-	coldPlugVFIO := (sandboxConfig.HypervisorConfig.ColdPlugVFIO != config.NoPort)
-	// Aggregate all the containner devices for hot-plug and use them to dedcue
-	// the correct amount of ports to reserve for the hypervisor.
-	hotPlugVFIO := (sandboxConfig.HypervisorConfig.HotPlugVFIO != config.NoPort)
-
-	modeIsGK := (sandboxConfig.VfioMode == config.VFIOModeGuestKernel)
-	// modeIsVFIO is needed at the container level not the sandbox level.
-	// modeIsVFIO := (sandboxConfig.VfioMode == config.VFIOModeVFIO)
-
-	var vfioDevices []config.DeviceInfo
-	// vhost-user-block device is a PCIe device in Virt, keep track of it
-	// for correct number of PCIe root ports.
-	var vhostUserBlkDevices []config.DeviceInfo
-
-	for cnt, containers := range sandboxConfig.Containers {
-		for dev, device := range containers.DeviceInfos {
-
-			if deviceManager.IsVhostUserBlk(device) {
-				vhostUserBlkDevices = append(vhostUserBlkDevices, device)
-				continue
-			}
-			isVFIODevice := deviceManager.IsVFIODevice(device.ContainerPath)
-			if hotPlugVFIO && isVFIODevice {
-				device.ColdPlug = false
-				device.Port = sandboxConfig.HypervisorConfig.HotPlugVFIO
-				vfioDevices = append(vfioDevices, device)
-				sandboxConfig.Containers[cnt].DeviceInfos[dev].Port = sandboxConfig.HypervisorConfig.HotPlugVFIO
-			}
-			if coldPlugVFIO && isVFIODevice {
-				device.ColdPlug = true
-				device.Port = sandboxConfig.HypervisorConfig.ColdPlugVFIO
-				vfioDevices = append(vfioDevices, device)
-				// We need to remove the devices marked for cold-plug
-				// otherwise at the container level the kata-agent
-				// will try to hot-plug them.
-				if modeIsGK {
-					sandboxConfig.Containers[cnt].DeviceInfos[dev].ID = "remove-we-are-cold-plugging"
-				}
-			}
-		}
-		var filteredDevices []config.DeviceInfo
-		for _, device := range containers.DeviceInfos {
-			if device.ID != "remove-we-are-cold-plugging" {
-				filteredDevices = append(filteredDevices, device)
-			}
-		}
-		sandboxConfig.Containers[cnt].DeviceInfos = filteredDevices
-	}
-
-	sandboxConfig.HypervisorConfig.VFIODevices = vfioDevices
-	sandboxConfig.HypervisorConfig.VhostUserBlkDevices = vhostUserBlkDevices
-
-	return coldPlugVFIO, nil
-}
-
 func setHypervisorConfigAnnotations(sandboxConfig *SandboxConfig) {
 	if len(sandboxConfig.Containers) > 0 {
 		// These values are required by remote hypervisor
@@ -741,6 +704,125 @@ func setHypervisorConfigAnnotations(sandboxConfig *SandboxConfig) {
 			}
 		}
 	}
+}
+
+func (s *Sandbox) coldOrHotPlugVFIO(sandboxConfig *SandboxConfig) (bool, error) {
+	// If we have a confidential guest we need to cold-plug the PCIe VFIO devices
+	// until we have TDISP/IDE PCIe support.
+	coldPlugVFIO := (sandboxConfig.HypervisorConfig.ColdPlugVFIO != config.NoPort)
+	// Aggregate all the containner devices for hot-plug and use them to dedcue
+	// the correct amount of ports to reserve for the hypervisor.
+	hotPlugVFIO := (sandboxConfig.HypervisorConfig.HotPlugVFIO != config.NoPort)
+
+	//modeIsGK := (sandboxConfig.VfioMode == config.VFIOModeGuestKernel)
+	// modeIsVFIO is needed at the container level not the sandbox level.
+	// modeIsVFIO := (sandboxConfig.VfioMode == config.VFIOModeVFIO)
+
+	var vfioDevices []config.DeviceInfo
+	// vhost-user-block device is a PCIe device in Virt, keep track of it
+	// for correct number of PCIe root ports.
+	var vhostUserBlkDevices []config.DeviceInfo
+
+	//io.katacontainers.pkg.oci.container_type:pod_sandbox
+
+	for cnt, container := range sandboxConfig.Containers {
+		// Do not alter the original spec, we do not want to inject
+		// CDI devices into the sandbox container, were using the CDI
+		// devices as additional information to determine the number of
+		// PCIe root ports to reserve for the hypervisor.
+		// A single_container type will have the CDI devices injected
+		// only do this if we're a pod_sandbox type.
+		if container.Annotations["io.katacontainers.pkg.oci.container_type"] == "pod_sandbox" && container.CustomSpec != nil {
+			cdiSpec := container.CustomSpec
+			// We can provide additional directories where to search for
+			// CDI specs if needed. immutable OS's only have specific
+			// directories where applications can write too. For instance /opt/cdi
+			//
+			// _, err = withCDI(ociSpec.Annotations, []string{"/opt/cdi"}, ociSpec)
+			//
+			_, err := config.WithCDI(cdiSpec.Annotations, []string{}, cdiSpec)
+			if err != nil {
+				return coldPlugVFIO, fmt.Errorf("adding CDI devices failed")
+			}
+
+			for _, dev := range cdiSpec.Linux.Devices {
+				isVFIODevice := deviceManager.IsVFIODevice(dev.Path)
+				if hotPlugVFIO && isVFIODevice {
+					vfioDev := config.DeviceInfo{
+						ColdPlug:      true,
+						ContainerPath: dev.Path,
+						Port:          sandboxConfig.HypervisorConfig.HotPlugVFIO,
+						DevType:       dev.Type,
+						Major:         dev.Major,
+						Minor:         dev.Minor,
+					}
+					if dev.FileMode != nil {
+						vfioDev.FileMode = *dev.FileMode
+					}
+					if dev.UID != nil {
+						vfioDev.UID = *dev.UID
+					}
+					if dev.GID != nil {
+						vfioDev.GID = *dev.GID
+					}
+
+					vfioDevices = append(vfioDevices, vfioDev)
+					continue
+				}
+				if coldPlugVFIO && isVFIODevice {
+					vfioDev := config.DeviceInfo{
+						ColdPlug:      true,
+						ContainerPath: dev.Path,
+						Port:          sandboxConfig.HypervisorConfig.ColdPlugVFIO,
+						DevType:       dev.Type,
+						Major:         dev.Major,
+						Minor:         dev.Minor,
+					}
+					if dev.FileMode != nil {
+						vfioDev.FileMode = *dev.FileMode
+					}
+					if dev.UID != nil {
+						vfioDev.UID = *dev.UID
+					}
+					if dev.GID != nil {
+						vfioDev.GID = *dev.GID
+					}
+
+					vfioDevices = append(vfioDevices, vfioDev)
+					continue
+				}
+			}
+		}
+		// As stated before the single_container will have the  CDI
+		// devices injected by the runtime. For the pod_container use-case
+		// see container.go how cold and hot-plug are handled.
+		for dev, device := range container.DeviceInfos {
+			if deviceManager.IsVhostUserBlk(device) {
+				vhostUserBlkDevices = append(vhostUserBlkDevices, device)
+				continue
+			}
+			isVFIODevice := deviceManager.IsVFIODevice(device.ContainerPath)
+			if hotPlugVFIO && isVFIODevice {
+				device.ColdPlug = false
+				device.Port = sandboxConfig.HypervisorConfig.HotPlugVFIO
+				vfioDevices = append(vfioDevices, device)
+				sandboxConfig.Containers[cnt].DeviceInfos[dev].Port = sandboxConfig.HypervisorConfig.HotPlugVFIO
+				continue
+			}
+			if coldPlugVFIO && isVFIODevice {
+				device.ColdPlug = true
+				device.Port = sandboxConfig.HypervisorConfig.ColdPlugVFIO
+				vfioDevices = append(vfioDevices, device)
+				sandboxConfig.Containers[cnt].DeviceInfos[dev].Port = sandboxConfig.HypervisorConfig.ColdPlugVFIO
+				continue
+			}
+		}
+	}
+
+	sandboxConfig.HypervisorConfig.VFIODevices = vfioDevices
+	sandboxConfig.HypervisorConfig.VhostUserBlkDevices = vhostUserBlkDevices
+
+	return coldPlugVFIO, nil
 }
 
 func (s *Sandbox) createResourceController() error {
@@ -1193,12 +1275,15 @@ func (cw *consoleWatcher) start(s *Sandbox) (err error) {
 
 	go func() {
 		for scanner.Scan() {
-			s.Logger().WithFields(logrus.Fields{
-				"console-protocol": cw.proto,
-				"console-url":      cw.consoleURL,
-				"sandbox":          s.id,
-				"vmconsole":        scanner.Text(),
-			}).Debug("reading guest console")
+			text := scanner.Text()
+			if text != "" {
+				s.Logger().WithFields(logrus.Fields{
+					"console-protocol": cw.proto,
+					"console-url":      cw.consoleURL,
+					"sandbox":          s.id,
+					"vmconsole":        text,
+				}).Debug("reading guest console")
+			}
 		}
 
 		if err := scanner.Err(); err != nil {
@@ -1376,6 +1461,8 @@ func (s *Sandbox) startVM(ctx context.Context, prestartHookFunc func(context.Con
 
 	defer func() {
 		if err != nil {
+			// Log error, otherwise nobody might see it - StopVM could kill this process.
+			s.Logger().WithError(err).Error("Cannot start VM")
 			s.hypervisor.StopVM(ctx, false)
 		}
 	}()
@@ -2170,6 +2257,29 @@ func (s *Sandbox) AddDevice(ctx context.Context, info config.DeviceInfo) (api.De
 	return add, nil
 }
 
+// GetVfioDeviceGuestPciPath return a device's guest PCI path by its host BDF
+func (s *Sandbox) GetVfioDeviceGuestPciPath(hostBDF string) types.PciPath {
+	devices := s.devManager.GetAllDevices()
+	for _, device := range devices {
+		switch device.DeviceType() {
+		case config.DeviceVFIO:
+			vfioDevices, ok := device.GetDeviceInfo().([]*config.VFIODev)
+			if !ok {
+				continue
+			}
+			for _, vfioDev := range vfioDevices {
+				if vfioDev.BDF == hostBDF {
+					return vfioDev.GuestPciPath
+				}
+			}
+		default:
+			continue
+		}
+	}
+
+	return types.PciPath{}
+}
+
 // updateResources will:
 // - calculate the resources required for the virtual machine, and adjust the virtual machine
 // sizing accordingly. For a given sandbox, it will calculate the number of vCPUs required based
@@ -2605,6 +2715,11 @@ func (s *Sandbox) GetIPTables(ctx context.Context, isIPv6 bool) ([]byte, error) 
 // SetIPTables will set the iptables in the guest
 func (s *Sandbox) SetIPTables(ctx context.Context, isIPv6 bool, data []byte) error {
 	return s.agent.setIPTables(ctx, isIPv6, data)
+}
+
+// SetPolicy will set the policy in the guest
+func (s *Sandbox) SetPolicy(ctx context.Context, policy string) error {
+	return s.agent.setPolicy(ctx, policy)
 }
 
 // GuestVolumeStats return the filesystem stat of a given volume in the guest.

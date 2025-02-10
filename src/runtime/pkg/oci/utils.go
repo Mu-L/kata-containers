@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"regexp"
 	goruntime "runtime"
@@ -156,6 +157,13 @@ type RuntimeConfig struct {
 
 	// Determines if Kata creates emptyDir on the guest
 	DisableGuestEmptyDir bool
+
+	// CreateContainer timeout which, if provided, indicates the createcontainer request timeout
+	// needed for the workload ( Mostly used for pulling images in the guest )
+	CreateContainerTimeout uint64
+
+	// Base directory of directly attachable network config
+	DanConfig string
 }
 
 // AddKernelParam allows the addition of new kernel parameters to an existing
@@ -327,7 +335,11 @@ func containerDeviceInfos(spec specs.Spec) ([]config.DeviceInfo, error) {
 	return devices, nil
 }
 
-func networkConfig(ocispec specs.Spec, config RuntimeConfig) (vc.NetworkConfig, error) {
+func getDanConfigPath(danConfigDir string, sandboxID string) string {
+	return filepath.Join(danConfigDir, sandboxID+".json")
+}
+
+func networkConfig(ocispec specs.Spec, sandboxID string, config RuntimeConfig) (vc.NetworkConfig, error) {
 	linux := ocispec.Linux
 	if linux == nil {
 		return vc.NetworkConfig{}, ErrNoLinux
@@ -346,6 +358,12 @@ func networkConfig(ocispec specs.Spec, config RuntimeConfig) (vc.NetworkConfig, 
 	}
 	netConf.InterworkingModel = config.InterNetworkModel
 	netConf.DisableNewNetwork = config.DisableNewNetNs
+
+	// if dan config exits, it will be used to config network in guest VM
+	danConfig := getDanConfigPath(config.DanConfig, sandboxID)
+	if _, err := os.Stat(danConfig); err == nil {
+		netConf.DanConfigPath = danConfig
+	}
 
 	return netConf, nil
 }
@@ -459,6 +477,14 @@ func addHypervisorConfigOverrides(ocispec specs.Spec, config *vc.SandboxConfig, 
 		return err
 	}
 
+	if err := addHypervisorPCIeRootPortOverrides(ocispec, config); err != nil {
+		return err
+	}
+
+	if err := addHypervisorPCIeSwitchPortOverrides(ocispec, config); err != nil {
+		return err
+	}
+
 	if value, ok := ocispec.Annotations[vcAnnotations.MachineType]; ok {
 		if value != "" {
 			config.HypervisorConfig.HypervisorMachineType = value
@@ -530,6 +556,13 @@ func addHypervisorConfigOverrides(ocispec specs.Spec, config *vc.SandboxConfig, 
 
 		config.HypervisorConfig.SGXEPCSize = size
 	}
+	if initdata, ok := ocispec.Annotations[vcAnnotations.Initdata]; ok {
+		config.HypervisorConfig.Initdata = initdata
+	}
+
+	if err := addHypervisorGPUOverrides(ocispec, config); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -547,13 +580,6 @@ func addHypervisorPathOverrides(ocispec specs.Spec, config *vc.SandboxConfig, ru
 			return fmt.Errorf("jailer %v required from annotation is not valid", value)
 		}
 		config.HypervisorConfig.JailerPath = value
-	}
-
-	if value, ok := ocispec.Annotations[vcAnnotations.CtlPath]; ok {
-		if !checkPathIsInGlobs(runtime.HypervisorConfig.HypervisorCtlPathList, value) {
-			return fmt.Errorf("hypervisor control %v required from annotation is not valid", value)
-		}
-		config.HypervisorConfig.HypervisorCtlPath = value
 	}
 
 	if value, ok := ocispec.Annotations[vcAnnotations.KernelParams]; ok {
@@ -601,10 +627,33 @@ func addHypervisorHotColdPlugVfioOverrides(ocispec specs.Spec, sbConfig *vc.Sand
 	return nil
 }
 
+func addHypervisorPCIeRootPortOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig) error {
+
+	if err := newAnnotationConfiguration(ocispec, vcAnnotations.PCIeRootPort).setUint(func(pcieRootPort uint64) {
+		if pcieRootPort > 0 {
+			sbConfig.HypervisorConfig.PCIeRootPort = uint32(pcieRootPort)
+		}
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func addHypervisorPCIeSwitchPortOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig) error {
+	if err := newAnnotationConfiguration(ocispec, vcAnnotations.PCIeSwitchPort).setUint(func(pcieSwitchPort uint64) {
+		if pcieSwitchPort > 0 {
+			sbConfig.HypervisorConfig.PCIeSwitchPort = uint32(pcieSwitchPort)
+		}
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
 func addHypervisorMemoryOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig, runtime RuntimeConfig) error {
 
 	if err := newAnnotationConfiguration(ocispec, vcAnnotations.DefaultMemory).setUintWithCheck(func(memorySz uint64) error {
-		if memorySz < vc.MinHypervisorMemory {
+		if memorySz < vc.MinHypervisorMemory && sbConfig.HypervisorType != vc.RemoteHypervisor {
 			return fmt.Errorf("Memory specified in annotation %s is less than minimum required %d, please specify a larger value", vcAnnotations.DefaultMemory, vc.MinHypervisorMemory)
 		}
 		sbConfig.HypervisorConfig.MemorySize = uint32(memorySz)
@@ -685,7 +734,7 @@ func addHypervisorCPUOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig) e
 	numCPUs := goruntime.NumCPU()
 
 	if err := newAnnotationConfiguration(ocispec, vcAnnotations.DefaultVCPUs).setFloat32WithCheck(func(vcpus float32) error {
-		if vcpus > float32(numCPUs) {
+		if vcpus > float32(numCPUs) && sbConfig.HypervisorType != vc.RemoteHypervisor {
 			return fmt.Errorf("Number of cpus %f specified in annotation default_vcpus is greater than the number of CPUs %d on the system", vcpus, numCPUs)
 		}
 		sbConfig.HypervisorConfig.NumVCPUsF = float32(vcpus)
@@ -697,16 +746,36 @@ func addHypervisorCPUOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig) e
 	return newAnnotationConfiguration(ocispec, vcAnnotations.DefaultMaxVCPUs).setUintWithCheck(func(maxVCPUs uint64) error {
 		max := uint32(maxVCPUs)
 
-		if max > uint32(numCPUs) {
+		if max > uint32(numCPUs) && sbConfig.HypervisorType != vc.RemoteHypervisor {
 			return fmt.Errorf("Number of cpus %d in annotation default_maxvcpus is greater than the number of CPUs %d on the system", max, numCPUs)
 		}
 
-		if sbConfig.HypervisorType == vc.QemuHypervisor && max > govmm.MaxVCPUs() {
+		if sbConfig.HypervisorType == vc.QemuHypervisor && max > govmm.MaxVCPUs() && sbConfig.HypervisorType != vc.RemoteHypervisor {
 			return fmt.Errorf("Number of cpus %d in annotation default_maxvcpus is greater than max no of CPUs %d supported for qemu", max, govmm.MaxVCPUs())
 		}
 		sbConfig.HypervisorConfig.DefaultMaxVCPUs = max
 		return nil
 	})
+}
+
+func addHypervisorGPUOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig) error {
+	if sbConfig.HypervisorType != vc.RemoteHypervisor {
+		return nil
+	}
+
+	if err := newAnnotationConfiguration(ocispec, vcAnnotations.DefaultGPUs).setUint(func(gpus uint64) {
+		sbConfig.HypervisorConfig.DefaultGPUs = uint32(gpus)
+	}); err != nil {
+		return err
+	}
+
+	if value, ok := ocispec.Annotations[vcAnnotations.DefaultGPUModel]; ok {
+		if value != "" {
+			sbConfig.HypervisorConfig.DefaultGPUModel = value
+		}
+	}
+
+	return nil
 }
 
 func addHypervisorBlockOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig) error {
@@ -864,6 +933,12 @@ func addRuntimeConfigOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig, r
 		return err
 	}
 
+	if err := newAnnotationConfiguration(ocispec, vcAnnotations.CreateContainerTimeout).setUint(func(createContainerTimeout uint64) {
+		sbConfig.CreateContainerTimeout = createContainerTimeout
+	}); err != nil {
+		return err
+	}
+
 	if err := newAnnotationConfiguration(ocispec, vcAnnotations.EnableVCPUsPinning).setBool(func(enableVCPUsPinning bool) {
 		sbConfig.EnableVCPUsPinning = enableVCPUsPinning
 	}); err != nil {
@@ -961,7 +1036,7 @@ func SandboxConfig(ocispec specs.Spec, runtime RuntimeConfig, bundlePath, cid st
 		return vc.SandboxConfig{}, err
 	}
 
-	networkConfig, err := networkConfig(ocispec, runtime)
+	networkConfig, err := networkConfig(ocispec, cid, runtime)
 	if err != nil {
 		return vc.SandboxConfig{}, err
 	}
@@ -1007,6 +1082,8 @@ func SandboxConfig(ocispec specs.Spec, runtime RuntimeConfig, bundlePath, cid st
 		GuestSeLinuxLabel: runtime.GuestSeLinuxLabel,
 
 		Experimental: runtime.Experimental,
+
+		CreateContainerTimeout: runtime.CreateContainerTimeout,
 	}
 
 	if err := addAnnotations(ocispec, &sandboxConfig, runtime); err != nil {
@@ -1022,6 +1099,8 @@ func SandboxConfig(ocispec specs.Spec, runtime RuntimeConfig, bundlePath, cid st
 
 		sandboxConfig.HypervisorConfig.NumVCPUsF += sandboxConfig.SandboxResources.WorkloadCPUs
 		sandboxConfig.HypervisorConfig.MemorySize += sandboxConfig.SandboxResources.WorkloadMemMB
+
+		sandboxConfig.HypervisorConfig.DefaultMaxVCPUs = sandboxConfig.HypervisorConfig.NumVCPUs()
 
 		ociLog.WithFields(logrus.Fields{
 			"workload cpu":       sandboxConfig.SandboxResources.WorkloadCPUs,

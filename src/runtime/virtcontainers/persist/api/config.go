@@ -36,10 +36,6 @@ type HypervisorConfig struct {
 	// HypervisorPath is the hypervisor executable host path.
 	HypervisorPath string
 
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
-	HypervisorCtlPath string
-
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
 	// JailerPath is the jailer executable host path.
 	JailerPath string
 
@@ -93,9 +89,6 @@ type HypervisorConfig struct {
 
 	// HypervisorPathList is the list of hypervisor paths names allowed in annotations
 	HypervisorPathList []string
-
-	// HypervisorCtlPathList is the list of hypervisor control paths names allowed in annotations
-	HypervisorCtlPathList []string
 
 	// JailerPathList is the list of jailer paths names allowed in annotations
 	JailerPathList []string
@@ -198,6 +191,12 @@ type HypervisorConfig struct {
 	// ColdPlugVFIO is used to indicate if devices need to be coldplugged on the
 	// root, bridge, switch or no-port
 	ColdPlugVFIO config.PCIePort
+
+	// PCIeRootPort is the number of ports needed in the hypvervisor
+	PCIeRootPort uint32
+
+	// PCIeSwitchPort is the number of ports needed in the hypvervisor
+	PCIeSwitchPort uint32
 
 	// BootToBeTemplate used to indicate if the VM is created to be a template VM
 	BootToBeTemplate bool

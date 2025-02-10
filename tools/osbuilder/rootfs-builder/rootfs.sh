@@ -17,6 +17,8 @@ RUST_VERSION="null"
 AGENT_BIN=${AGENT_BIN:-kata-agent}
 AGENT_INIT=${AGENT_INIT:-no}
 MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
+# The kata agent enables guest-pull feature.
+PULL_TYPE=${PULL_TYPE:-default}
 KERNEL_MODULES_DIR=${KERNEL_MODULES_DIR:-""}
 OSBUILDER_VERSION="unknown"
 DOCKER_RUNTIME=${DOCKER_RUNTIME:-runc}
@@ -31,9 +33,29 @@ AGENT_POLICY=${AGENT_POLICY:-no}
 AGENT_SOURCE_BIN=${AGENT_SOURCE_BIN:-""}
 AGENT_TARBALL=${AGENT_TARBALL:-""}
 COCO_GUEST_COMPONENTS_TARBALL=${COCO_GUEST_COMPONENTS_TARBALL:-""}
+CONFIDENTIAL_GUEST="${CONFIDENTIAL_GUEST:-no}"
+PAUSE_IMAGE_TARBALL=${PAUSE_IMAGE_TARBALL:-""}
 
 lib_file="${script_dir}/../scripts/lib.sh"
 source "$lib_file"
+
+if [[ "${AGENT_POLICY}" == "yes" ]]; then
+	agent_policy_file="$(readlink -f -v "${AGENT_POLICY_FILE:-"${script_dir}/../../../src/kata-opa/allow-all.rego"}")"
+fi
+
+INSIDE_CONTAINER=${INSIDE_CONTAINER:-""}
+IMAGE_REGISTRY=${IMAGE_REGISTRY:-""}
+http_proxy=${http_proxy:-""}
+https_proxy=${https_proxy:-""}
+AGENT_POLICY_FILE=${AGENT_POLICY_FILE:-""}
+GRACEFUL_EXIT=${GRACEFUL_EXIT:-""}
+USE_DOCKER=${USE_DOCKER:-""}
+USE_PODMAN=${USE_PODMAN:-""}
+EXTRA_PKGS=${EXTRA_PKGS:-""}
+
+NVIDIA_GPU_STACK=${NVIDIA_GPU_STACK:-""}
+nvidia_rootfs="${script_dir}/nvidia/nvidia_rootfs.sh"
+[ "${ARCH}" == "x86_64" ] || [ "${ARCH}" == "aarch64" ] && source "$nvidia_rootfs"
 
 #For cross build
 CROSS_BUILD=${CROSS_BUILD:-false}
@@ -54,6 +76,29 @@ if [ "${CROSS_BUILD}" == "true" ]; then
 	fi
 fi
 
+# The list of systemd units and files that are not needed in Kata Containers
+readonly -a systemd_units=(
+	"systemd-coredump@"
+	"systemd-journald"
+	"systemd-journald-dev-log"
+	"systemd-journal-flush"
+	"systemd-random-seed"
+	"systemd-timesyncd"
+	"systemd-tmpfiles-setup"
+	"systemd-udevd"
+	"systemd-udevd-control"
+	"systemd-udevd-kernel"
+	"systemd-udev-trigger"
+	"systemd-update-utmp"
+)
+
+readonly -a systemd_files=(
+	"systemd-bless-boot-generator"
+	"systemd-fstab-generator"
+	"systemd-getty-generator"
+	"systemd-gpt-auto-generator"
+	"systemd-tmpfiles-cleanup.timer"
+)
 
 handle_error() {
 	local exit_code="${?}"
@@ -65,7 +110,6 @@ handle_error() {
 trap 'handle_error $LINENO' ERR
 
 # Default architecture
-export ARCH=${ARCH:-$(uname -m)}
 if [ "$ARCH" == "ppc64le" ] || [ "$ARCH" == "s390x" ]; then
 	LIBC=gnu
 	echo "WARNING: Forcing LIBC=gnu because $ARCH has no musl Rust target"
@@ -126,6 +170,11 @@ AGENT_INIT          When set to "yes", use ${AGENT_BIN} as init process in place
                     of systemd.
                     Default value: no
 
+AGENT_POLICY_FILE   Path to the agent policy rego file to be set in the rootfs.
+                    If defined, this overwrites the default setting of the
+                    permissive policy file.
+                    Default value: allow-all.rego
+
 AGENT_SOURCE_BIN    Path to the directory of agent binary.
                     If set, use the binary as agent but not build agent package.
                     AGENT_SOURCE_BIN and AGENT_TARBALL should never be used toghether.
@@ -174,6 +223,12 @@ KERNEL_MODULES_DIR  Path to a directory containing kernel modules to include in
 
 LIBC                libc the agent is built against (gnu or musl).
                     Default value: ${LIBC} (varies with architecture)
+
+PAUSE_IMAGE_TARBALL Path to the kata-static-pause-image.tar.xz tarball to be unpacked inside the
+                    rootfs.
+                    If set, the tarball will be unpacked onto the rootfs.
+                    Default value: <not set>
+
 
 ROOTFS_DIR          Path to the directory that is populated with the rootfs.
                     Default value: <${script_name} path>/rootfs-<DISTRO-name>
@@ -345,6 +400,10 @@ check_env_variables()
 
 	[ -n "${KERNEL_MODULES_DIR}" ] && [ ! -d "${KERNEL_MODULES_DIR}" ] && die "KERNEL_MODULES_DIR defined but is not an existing directory"
 
+	if [[ "${AGENT_POLICY}" == "yes" ]]; then
+		[ ! -f "${agent_policy_file}" ] && die "agent policy file not found in '${agent_policy_file}'"
+	fi
+
 	[ -n "${OSBUILDER_VERSION}" ] || die "need osbuilder version"
 }
 
@@ -385,12 +444,6 @@ build_rootfs_distro()
 		mkdir -p ${ROOTFS_DIR}
 	fi
 
-	# need to detect rustc's version too?
-	detect_rust_version ||
-		die "Could not detect the required rust version for AGENT_VERSION='${AGENT_VERSION:-main}'."
-
-	echo "Required rust version: $RUST_VERSION"
-
 	if [ "${SELINUX}" == "yes" ]; then
 		if [ "${AGENT_INIT}" == "yes" ]; then
 			die "Guest SELinux with the agent init is not supported yet"
@@ -424,6 +477,8 @@ build_rootfs_distro()
 			${engine_build_args} \
 			--build-arg http_proxy="${http_proxy}" \
 			--build-arg https_proxy="${https_proxy}" \
+			--build-arg RUST_TOOLCHAIN="$(get_package_version_from_kata_yaml  "languages.rust.meta.newest-version")" \
+			--build-arg GO_VERSION="$(get_package_version_from_kata_yaml  "languages.golang.version")" \
 			-t "${image_name}" "${distro_config_dir}"
 
 		# fake mapping if KERNEL_MODULES_DIR is unset
@@ -447,6 +502,17 @@ build_rootfs_distro()
 		if [ -n "${AGENT_TARBALL}" ] ; then
 			engine_run_args+=" --env AGENT_TARBALL=${AGENT_TARBALL}"
 			engine_run_args+=" -v $(dirname ${AGENT_TARBALL}):$(dirname ${AGENT_TARBALL})"
+		fi
+
+		if [ -n "${COCO_GUEST_COMPONENTS_TARBALL}" ] ; then
+			CONFIDENTIAL_GUEST="yes"
+			engine_run_args+=" --env COCO_GUEST_COMPONENTS_TARBALL=${COCO_GUEST_COMPONENTS_TARBALL}"
+			engine_run_args+=" -v $(dirname ${COCO_GUEST_COMPONENTS_TARBALL}):$(dirname ${COCO_GUEST_COMPONENTS_TARBALL})"
+		fi
+
+		if [ -n "${PAUSE_IMAGE_TARBALL}" ]; then
+			engine_run_args+=" --env PAUSE_IMAGE_TARBALL=${PAUSE_IMAGE_TARBALL}"
+			engine_run_args+=" -v $(dirname ${PAUSE_IMAGE_TARBALL}):$(dirname ${PAUSE_IMAGE_TARBALL})"
 		fi
 
 		engine_run_args+=" -v ${GOPATH_LOCAL}:${GOPATH_LOCAL} --env GOPATH=${GOPATH_LOCAL}"
@@ -479,14 +545,15 @@ build_rootfs_distro()
 			--env ROOTFS_DIR="/rootfs" \
 			--env AGENT_BIN="${AGENT_BIN}" \
 			--env AGENT_INIT="${AGENT_INIT}" \
+			--env AGENT_POLICY_FILE="${AGENT_POLICY_FILE}" \
 			--env ARCH="${ARCH}" \
-			--env CI="${CI}" \
 			--env MEASURED_ROOTFS="${MEASURED_ROOTFS}" \
 			--env KERNEL_MODULES_DIR="${KERNEL_MODULES_DIR}" \
 			--env LIBC="${LIBC}" \
 			--env EXTRA_PKGS="${EXTRA_PKGS}" \
 			--env OSBUILDER_VERSION="${OSBUILDER_VERSION}" \
 			--env OS_VERSION="${OS_VERSION}" \
+			--env VARIANT="${VARIANT}" \
 			--env INSIDE_CONTAINER=1 \
 			--env SECCOMP="${SECCOMP}" \
 			--env SELINUX="${SELINUX}" \
@@ -495,6 +562,8 @@ build_rootfs_distro()
 			--env TARGET_ARCH="${TARGET_ARCH}" \
 			--env HOME="/root" \
 			--env AGENT_POLICY="${AGENT_POLICY}" \
+			--env CONFIDENTIAL_GUEST="${CONFIDENTIAL_GUEST}" \
+			--env NVIDIA_GPU_STACK="${NVIDIA_GPU_STACK}" \
 			-v "${repo_dir}":"/kata-containers" \
 			-v "${ROOTFS_DIR}":"/rootfs" \
 			-v "${script_dir}/../scripts":"/scripts" \
@@ -524,39 +593,6 @@ prepare_overlay()
 	fi
 
 	popd  > /dev/null
-}
-
-build_opa_from_source()
-{
-	local opa_repo_url=$1
-	opa_version="$(get_package_version_from_kata_yaml externals.open-policy-agent.version)"
-
-	if [ ${CROSS_BUILD} == "yes" ]; then
-		export GOOS="${TARGET_OS}"
-		export GOARCH="${TARGET_ARCH}}"
-	fi
-
-	current_dir="$(pwd)"
-	pushd $(mktemp -d) &>/dev/null
-	git clone -b "${opa_version}" "${opa_repo_url}" opa || return 1
-	(
-		cd opa
-		export WASM_ENABLED=0
-		export DOCKER_RUNNING=0
-		make ci-go-ci-build-linux-static || return 1
-
-		info "Copy OPA binary to ${current_dir}/opa"
-		binary_name="_release/${opa_version##v}/opa_${GOOS}_${GOARCH}_static"
-		if [ -f "${binary_name}" ]; then
-			cp "${binary_name}" "${current_dir}/opa"
-		else
-			echo "OPA binary ${binary_name} not found"
-			return 1
-		fi
-	)
-	rm -rf opa
-	popd &>/dev/null
-	return 0
 }
 
 # Setup an existing rootfs directory, based on the OPTIONAL distro name
@@ -656,13 +692,13 @@ EOF
 
 	if [ -z "${AGENT_SOURCE_BIN}" ] && [ -z "${AGENT_TARBALL}" ] ; then
 		test -r "${HOME}/.cargo/env" && source "${HOME}/.cargo/env"
-		# rust agent needs ${arch}-unknown-linux-${LIBC}
+		# rust agent needs ${ARCH}-unknown-linux-${LIBC}
 		if ! (rustup show | grep -v linux-${LIBC} > /dev/null); then
 			if [ "$RUST_VERSION" == "null" ]; then
 				detect_rust_version || \
 					die "Could not detect the required rust version for AGENT_VERSION='${AGENT_VERSION:-main}'."
 			fi
-			bash ${script_dir}/../../../ci/install_rust.sh ${RUST_VERSION}
+			bash ${script_dir}/../../../tests/install_rust.sh ${RUST_VERSION}
 		fi
 		test -r "${HOME}/.cargo/env" && source "${HOME}/.cargo/env"
 
@@ -686,7 +722,7 @@ EOF
 			git checkout "${AGENT_VERSION}" && OK "git checkout successful" || die "checkout agent ${AGENT_VERSION} failed!"
 		fi
 		make clean
-		make LIBC=${LIBC} INIT=${AGENT_INIT} SECCOMP=${SECCOMP} AGENT_POLICY=${AGENT_POLICY}
+		make LIBC=${LIBC} INIT=${AGENT_INIT} SECCOMP=${SECCOMP} AGENT_POLICY=${AGENT_POLICY} PULL_TYPE=${PULL_TYPE}
 		make install DESTDIR="${ROOTFS_DIR}" LIBC=${LIBC} INIT=${AGENT_INIT}
 		if [ "${SECCOMP}" == "yes" ]; then
 			rm -rf "${libseccomp_install_dir}" "${gperf_install_dir}"
@@ -708,87 +744,51 @@ EOF
 	if [ "${AGENT_INIT}" == "yes" ]; then
 		setup_agent_init "${AGENT_DEST}" "${init}"
 	else
+		info "Setup systemd-base environment for kata-agent"
 		# Setup systemd-based environment for kata-agent
 		mkdir -p "${ROOTFS_DIR}/etc/systemd/system/basic.target.wants"
 		ln -sf "/usr/lib/systemd/system/kata-containers.target" "${ROOTFS_DIR}/etc/systemd/system/basic.target.wants/kata-containers.target"
 		mkdir -p "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants"
 		ln -sf "/usr/lib/systemd/system/dbus.socket" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/dbus.socket"
 		chmod g+rx,o+x "${ROOTFS_DIR}"
+
+		if [ "${CONFIDENTIAL_GUEST}" == "yes" ]; then
+			info "Tweaking /run to use 50% of the available memory"
+			# Tweak the kata-agent service to have /run using 50% of the memory available
+			# This is needed as, by default, systemd would only allow 10%, which is way
+			# too low, even for very small test images
+			fstab_file="${ROOTFS_DIR}/etc/fstab"
+			[ -e ${fstab_file} ] && sed -i '/\/run/d' ${fstab_file}
+			echo "tmpfs /run tmpfs nodev,nosuid,size=50% 0 0" >> ${fstab_file}
+
+			kata_systemd_target="${ROOTFS_DIR}/usr/lib/systemd/system/kata-containers.target"
+			grep -qE "^Requires=.*systemd-remount-fs.service.*" ${kata_systemd_target} || \
+				echo "Requires=systemd-remount-fs.service" >> ${kata_systemd_target}
+		fi
 	fi
 
-	if [ "${AGENT_POLICY}" == "yes" ]; then
-		# Setup systemd-based environment for kata-opa.
-		local opa_bin_dir="$(get_opa_bin_dir "${ROOTFS_DIR}")"
-		if [ -z "${opa_bin_dir}" ]; then
-			# OPA was not installed already, so download it here.
-			#
-			# TODO: if an OPA package is not available for the Guest image distro,
-			#   	Kata should cache the OPA source code, toolchain information, etc.
-			#   	OPA should be built from the cached source code instead of downloading
-			#   	this binary.
-			#
-			local opa_repo_url="$(get_package_version_from_kata_yaml externals.open-policy-agent.url)"
-			local opa_version="$(get_package_version_from_kata_yaml externals.open-policy-agent.version)"
-			if [ "$ARCH" == "ppc64le" ] || [ "$ARCH" == "s390x" ]; then
-				info "Building OPA binary from source at ${opa_repo_url}"
-				build_opa_from_source "${opa_repo_url}" || die "Failed to build OPA"
-			else
-				local opa_binary_arch
-				case ${ARCH} in
-					x86_64) opa_binary_arch="amd64" ;;
-					aarch64) opa_binary_arch="arm64" ;;
-					*) die "Unsupported architecture for the OPA binary" ;;
-				esac
-
-				local opa_bin_url="${opa_repo_url}/releases/download/${opa_version}/opa_linux_${opa_binary_arch}_static"
-				info "Downloading OPA binary from ${opa_bin_url}"
-				curl --fail -L "${opa_bin_url}" -o opa || die "Failed to download OPA"
-			fi
-
-			# Install the OPA binary.
-			opa_bin_dir="/usr/local/bin"
-			local opa_bin="${ROOTFS_DIR}${opa_bin_dir}/opa"
-			info "Installing OPA binary to ${opa_bin}"
-			install -D -o root -g root -m 0755 opa -T "${opa_bin}"
-			${stripping_tool} ${ROOTFS_DIR}${opa_bin_dir}/opa
-		else
-			info "OPA binary already exists in ${opa_bin_dir}"
-		fi
-
+	if [[ "${AGENT_POLICY}" == "yes" ]]; then
+		info "Install the default policy"
 		# Install default settings for the kata-opa service.
-		local kata_opa_in_dir="${script_dir}/../../../src/kata-opa"
 		local opa_settings_dir="/etc/kata-opa"
-		local policy_file="allow-all.rego"
+		local policy_file_name="$(basename ${agent_policy_file})"
 		local policy_dir="${ROOTFS_DIR}/${opa_settings_dir}"
 		mkdir -p "${policy_dir}"
-		install -D -o root -g root -m 0644 "${kata_opa_in_dir}/${policy_file}" -T "${policy_dir}/${policy_file}"
-		ln -sf "${policy_file}" "${policy_dir}/default-policy.rego"
-
-		if [ "${AGENT_INIT}" == "yes" ]; then
-			info "OPA will be started by the kata agent"
-		else
-			# Install the unit file for the kata-opa service.
-			local kata_opa_unit="kata-opa.service"
-			local kata_opa_unit_path="${ROOTFS_DIR}/usr/lib/systemd/system/${kata_opa_unit}"
-			local kata_containers_wants="${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants"
-
-			opa_settings_dir="${opa_settings_dir//\//\\/}"
-			sed -e "s/@SETTINGSDIR@/${opa_settings_dir}/g" "${kata_opa_in_dir}/${kata_opa_unit}.in" > "${kata_opa_unit}"
-
-			opa_bin_dir="${opa_bin_dir//\//\\/}"
-			sed -i -e "s/@BINDIR@/${opa_bin_dir}/g" "${kata_opa_unit}"
-
-			install -D -o root -g root -m 0644 "${kata_opa_unit}" -T "${kata_opa_unit_path}"
-			mkdir -p "${kata_containers_wants}"
-			ln -sf "${kata_opa_unit_path}" "${kata_containers_wants}/${kata_opa_unit}"
-		fi
+		install -D -o root -g root -m 0644 "${agent_policy_file}" -T "${policy_dir}/${policy_file_name}"
+		ln -sf "${policy_file_name}" "${policy_dir}/default-policy.rego"
 	fi
 
 	info "Check init is installed"
 	[ -x "${init}" ] || [ -L "${init}" ] || die "/sbin/init is not installed in ${ROOTFS_DIR}"
 	OK "init is installed"
 
+	if [ -n "${PAUSE_IMAGE_TARBALL}" ] ; then
+		info "Installing the pause image tarball"
+		tar xvJpf ${PAUSE_IMAGE_TARBALL} -C ${ROOTFS_DIR}
+	fi
+
 	if [ -n "${COCO_GUEST_COMPONENTS_TARBALL}" ] ; then
+		info "Installing the Confidential Containers guest components tarball"
 		tar xvJpf ${COCO_GUEST_COMPONENTS_TARBALL} -C ${ROOTFS_DIR}
 	fi
 
@@ -801,26 +801,10 @@ EOF
 	info "Create /etc/resolv.conf file in rootfs if not exist"
 	touch "$dns_file"
 
+	delete_unnecessary_files
+
 	info "Creating summary file"
 	create_summary_file "${ROOTFS_DIR}"
-}
-
-get_opa_bin_dir()
-{
-	local rootfs_dir="$1"
-	local -a bin_dirs=(
-		"/bin"
-		"/usr/bin"
-		"/usr/local/bin"
-	)
-	for bin_dir in "${bin_dirs[@]}"
-	do
-		local opa_bin="${rootfs_dir}${bin_dir}/opa"
-		if [ -f "${opa_bin}" ]; then
-			echo "${bin_dir}"
-			return 0
-		fi
-	done
 }
 
 parse_arguments()
@@ -842,7 +826,6 @@ parse_arguments()
 
 	shift $(($OPTIND - 1))
 	distro="$1"
-	arch=$(uname -m)
 }
 
 detect_host_distro()
@@ -853,13 +836,31 @@ detect_host_distro()
 		"*suse*")
 			distro="suse"
 			;;
-		"clear-linux-os")
-			distro="clearlinux"
-			;;
 		*)
 			distro="$ID"
 			;;
 	esac
+}
+
+delete_unnecessary_files()
+{
+	info "Removing unneeded systemd services and sockets"
+	for u in "${systemd_units[@]}"; do
+		find "${ROOTFS_DIR}" \
+			\( -type f -o -type l \) \
+			\( -name "${u}.service" -o -name "${u}.socket" \) \
+			-exec echo "deleting {}" \; \
+			-exec rm -f {} \;
+	done
+
+	info "Removing unneeded systemd files"
+	for u in "${systemd_files[@]}"; do
+		find "${ROOTFS_DIR}" \
+			\( -type f -o -type l \) \
+			-name "${u}" \
+			-exec echo "deleting {}" \; \
+			-exec rm -f {} \;
+	done
 }
 
 main()
@@ -880,6 +881,18 @@ main()
 
 	init="${ROOTFS_DIR}/sbin/init"
 	setup_rootfs
+
+	if [ "${VARIANT}" = "nvidia-gpu" ]; then
+		setup_nvidia_gpu_rootfs_stage_one
+		setup_nvidia_gpu_rootfs_stage_two
+		return $?
+	fi
+
+	if [ "${VARIANT}" = "nvidia-gpu-confidential" ]; then
+		setup_nvidia_gpu_rootfs_stage_one "confidential"
+		setup_nvidia_gpu_rootfs_stage_two "confidential"
+		return $?
+	fi
 }
 
 main $*

@@ -9,12 +9,11 @@
 use crate::obj_meta;
 use crate::pod;
 use crate::policy;
-use crate::settings;
+use crate::utils::Config;
 use crate::yaml;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
-use protocols::agent;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -59,6 +58,21 @@ impl Secret {
 
         None
     }
+
+    pub fn get_key_value_pairs(&self) -> Option<Vec<String>> {
+        //eg ["key1=secret1", "key2=secret2"]
+        self.data
+            .as_ref()?
+            .keys()
+            .map(|key| {
+                let value = self.data.as_ref().unwrap().get(key).unwrap();
+                let value_bytes = general_purpose::STANDARD.decode(value).unwrap();
+                let value_string = std::str::from_utf8(&value_bytes).unwrap();
+                format!("{key}={value_string}")
+            })
+            .collect::<Vec<String>>()
+            .into()
+    }
 }
 
 pub fn get_value(value_from: &pod::EnvVarSource, secrets: &Vec<Secret>) -> Option<String> {
@@ -71,24 +85,22 @@ pub fn get_value(value_from: &pod::EnvVarSource, secrets: &Vec<Secret>) -> Optio
     None
 }
 
+pub fn get_values(secret_name: &str, secrets: &Vec<Secret>) -> Option<Vec<String>> {
+    for secret in secrets {
+        if let Some(existing_secret_name) = &secret.metadata.name {
+            if existing_secret_name == secret_name {
+                return secret.get_key_value_pairs();
+            }
+        }
+    }
+
+    None
+}
+
 #[async_trait]
 impl yaml::K8sResource for Secret {
-    async fn init(&mut self, _use_cache: bool, doc_mapping: &serde_yaml::Value, _silent: bool) {
+    async fn init(&mut self, _config: &Config, doc_mapping: &serde_yaml::Value, _silent: bool) {
         self.doc_mapping = doc_mapping.clone();
-    }
-
-    fn get_sandbox_name(&self) -> Option<String> {
-        panic!("Unsupported");
-    }
-
-    fn get_container_mounts_and_storages(
-        &self,
-        _policy_mounts: &mut Vec<policy::KataMount>,
-        _storages: &mut Vec<agent::Storage>,
-        _container: &pod::Container,
-        _settings: &settings::Settings,
-    ) {
-        panic!("Unsupported");
     }
 
     fn generate_policy(&self, _agent_policy: &policy::AgentPolicy) -> String {
@@ -97,21 +109,5 @@ impl yaml::K8sResource for Secret {
 
     fn serialize(&mut self, _policy: &str) -> String {
         serde_yaml::to_string(&self.doc_mapping).unwrap()
-    }
-
-    fn get_containers(&self) -> &Vec<pod::Container> {
-        panic!("Unsupported");
-    }
-
-    fn get_annotations(&self) -> &Option<BTreeMap<String, String>> {
-        panic!("Unsupported");
-    }
-
-    fn use_host_network(&self) -> bool {
-        panic!("Unsupported");
-    }
-
-    fn use_sandbox_pidns(&self) -> bool {
-        panic!("Unsupported");
     }
 }

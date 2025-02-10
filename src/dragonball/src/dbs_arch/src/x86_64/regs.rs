@@ -31,6 +31,11 @@ pub const X86_CR0_PG: u64 = 0x8000_0000;
 /// Physical Address Extension bit in CR4.
 pub const X86_CR4_PAE: u64 = 0x20;
 
+// MTRR constants.
+const MTRR_ENABLED: u64 = 0x0800; // IA32_MTRR_DEF_TYPE MSR: E (MTRRs enabled) flag, bit 11
+const MTRR_FIXED_RANGE_ENABLE: u64 = 0x0400;
+const MTRR_MEM_TYPE_WB: u64 = 0x6;
+
 /// Errors thrown while setting up x86_64 registers.
 #[derive(Debug)]
 pub enum Error {
@@ -215,6 +220,11 @@ fn create_msr_entries() -> Vec<kvm_msr_entry> {
         data: 0x0,
         ..Default::default()
     });
+    entries.push(kvm_msr_entry {
+        index: msr::MSR_MTRRdefType,
+        data: MTRR_ENABLED | MTRR_FIXED_RANGE_ENABLE | MTRR_MEM_TYPE_WB,
+        ..Default::default()
+    });
     // x86_64 specific msrs, we only run on x86_64 not x86.
     entries.push(kvm_msr_entry {
         index: msr::MSR_STAR,
@@ -369,7 +379,7 @@ mod tests {
         // tenth one (i.e the one with index msr_index::MSR_IA32_MISC_ENABLE has the data we
         // expect.
         let entry_vec = create_msr_entries();
-        assert_eq!(entry_vec[9], kvm_msrs.as_slice()[0]);
+        assert_eq!(entry_vec[10], kvm_msrs.as_slice()[0]);
     }
 
     #[test]

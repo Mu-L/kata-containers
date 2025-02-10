@@ -4,7 +4,8 @@
 
 OS_NAME=ubuntu
 # This should be Ubuntu's code name, e.g. "focal" (Focal Fossa) for 20.04
-OS_VERSION=${OS_VERSION:-focal}
+OS_VERSION=${OS_VERSION:-""}
+[ -z "$OS_VERSION" ] && echo "OS_VERSION is required, but was not set" && exit 1
 PACKAGES="chrony iptables dbus"
 [ "$AGENT_INIT" = no ] && PACKAGES+=" init"
 [ "$MEASURED_ROOTFS" = yes ] && PACKAGES+=" cryptsetup-bin e2fsprogs"

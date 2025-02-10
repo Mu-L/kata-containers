@@ -87,6 +87,8 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (testConfig testRuntime
 	enableIOThreads := true
 	hotPlugVFIO = config.NoPort
 	coldPlugVFIO = config.BridgePort
+	pcieRootPort := uint32(0)
+	pcieSwitchPort := uint32(0)
 	disableNewNetNs := false
 	sharedFS := "virtio-9p"
 	virtioFSdaemon := path.Join(dir, "virtiofsd")
@@ -109,6 +111,8 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (testConfig testRuntime
 		EnableIOThreads:      enableIOThreads,
 		HotPlugVFIO:          hotPlugVFIO,
 		ColdPlugVFIO:         coldPlugVFIO,
+		PCIeRootPort:         pcieRootPort,
+		PCIeSwitchPort:       pcieSwitchPort,
 		DisableNewNetNs:      disableNewNetNs,
 		DefaultVCPUCount:     defaultVCPUCount,
 		DefaultMaxVCPUCount:  defaultMaxVCPUCount,
@@ -172,6 +176,8 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (testConfig testRuntime
 		EnableIOThreads:       enableIOThreads,
 		HotPlugVFIO:           hotPlugVFIO,
 		ColdPlugVFIO:          coldPlugVFIO,
+		PCIeRootPort:          pcieRootPort,
+		PCIeSwitchPort:        pcieSwitchPort,
 		Msize9p:               defaultMsize9p,
 		MemSlots:              defaultMemSlots,
 		EntropySource:         defaultEntropySource,
@@ -182,6 +188,7 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (testConfig testRuntime
 		VirtioFSCache:         defaultVirtioFSCacheMode,
 		PFlash:                []string{},
 		SGXEPCSize:            epcSize,
+		QgsPort:               defaultQgsPort,
 	}
 
 	if goruntime.GOARCH == "arm64" && len(hypervisorConfig.PFlash) == 0 && hypervisorConfig.FirmwarePath == "" {
@@ -563,11 +570,14 @@ func TestMinimalRuntimeConfig(t *testing.T) {
 		Msize9p:               defaultMsize9p,
 		GuestHookPath:         defaultGuestHookPath,
 		VhostUserStorePath:    defaultVhostUserStorePath,
+		HypervisorLoglevel:    defaultHypervisorLoglevel,
 		VirtioFSCache:         defaultVirtioFSCacheMode,
 		BlockDeviceAIO:        defaultBlockDeviceAIO,
 		DisableGuestSeLinux:   defaultDisableGuestSeLinux,
 		HotPlugVFIO:           defaultHotPlugVFIO,
 		ColdPlugVFIO:          defaultColdPlugVFIO,
+		PCIeRootPort:          defaultPCIeRootPort,
+		PCIeSwitchPort:        defaultPCIeSwitchPort,
 	}
 
 	expectedAgentConfig := vc.KataAgentConfig{
@@ -609,6 +619,8 @@ func TestNewQemuHypervisorConfig(t *testing.T) {
 	disableBlock := true
 	enableIOThreads := true
 	coldPlugVFIO = config.BridgePort
+	pcieRootPort := uint32(0)
+	pcieSwitchPort := uint32(0)
 	orgVHostVSockDevicePath := utils.VHostVSockDevicePath
 	blockDeviceAIO := "io_uring"
 	defer func() {
@@ -627,6 +639,8 @@ func TestNewQemuHypervisorConfig(t *testing.T) {
 		DisableBlockDeviceUse: disableBlock,
 		EnableIOThreads:       enableIOThreads,
 		ColdPlugVFIO:          coldPlugVFIO,
+		PCIeRootPort:          pcieRootPort,
+		PCIeSwitchPort:        pcieSwitchPort,
 		RxRateLimiterMaxRate:  rxRateLimiterMaxRate,
 		TxRateLimiterMaxRate:  txRateLimiterMaxRate,
 		SharedFS:              "virtio-fs",
@@ -1757,9 +1771,6 @@ func TestUpdateRuntimeConfigHypervisor(t *testing.T) {
 
 	configFile := "/some/where/configuration.toml"
 
-	// Note: We cannot test acrnHypervisorTableType since
-	// newAcrnHypervisorConfig() expects ACRN binaries to be
-	// installed.
 	var entries = []tableTypeEntry{
 		{clhHypervisorTableType, true},
 		{dragonballHypervisorTableType, true},
@@ -1801,4 +1812,97 @@ func TestUpdateRuntimeConfigHypervisor(t *testing.T) {
 			assert.Equal(err, expectedErr, "test %d (%+v)", i, h)
 		}
 	}
+}
+
+func TestGetHostCPUs(t *testing.T) {
+	testCases := []struct {
+		input    string
+		expected uint32
+	}{
+		{
+			input: `processor   : 0
+processor   : 1
+vendor_id   : GenuineAmzing
+cpu family  : 6
+model       : 60
+model name  : whatever
+            ...
+processor   : 1
+vendor_id   : Genuine
+cpu family  : 6
+model       : 60
+model name  : Intel(R) Core(TM) i7-4770 CPU @ 3.40GHz
+...
+            `,
+			expected: 3,
+		},
+		{
+
+			input: `processor   : 0
+processor	: 1
+BogoMIPS	: 48.00
+Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512 asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp flagm2 frint
+CPU implementer	: 0x00
+CPU architecture: 8
+CPU variant	: 0x0
+CPU part	: 0x000
+CPU revision	: 00
+processor	: 2
+vendor_id   : GenuineAmzing
+processor	: 3
+cpu family  : 6
+processor	: 4
+model       : 60
+processor	: 5
+cpu family  : 6
+model       : 60
+
+
+model name  : Intel(R) Core(TM) i7-4770 CPU @ 3.40GHz
+...
+            `,
+			expected: 6,
+		},
+	}
+
+	for _, tc := range testCases {
+		// Create tmp file for mocking cpuinfo
+		file, err := os.CreateTemp("", "cpuinfo")
+		procCPUInfo = file.Name()
+		if err != nil {
+			t.Fatalf("Error creating temp file: %v", err)
+		}
+		defer os.Remove(file.Name())
+
+		if _, err := file.WriteString(tc.input); err != nil {
+			t.Fatalf("Error writing to temp file: %v", err)
+		}
+
+		if err := file.Close(); err != nil {
+			t.Fatalf("Error closing temp file: %v", err)
+		}
+
+		parsed := getHostCPUs()
+
+		if parsed != tc.expected {
+			t.Errorf("Expected number of cores: %d, got: %d", tc.expected, parsed)
+		}
+	}
+}
+
+func TestGetHostCPUsNoProc(t *testing.T) {
+
+	// override logger so we can check the output when calling function under test:
+	logBuf := &bytes.Buffer{}
+	kataUtilsLogger.Logger.Out = logBuf
+
+	// make sure we fail to read:
+	procCPUInfo = "/i/am/not/here"
+
+	getHostCPUs()
+
+	expectedLog := "unable to read /proc/cpuinfo to determine cpu count - using go runtime value instead"
+	actualLog := logBuf.String()
+	assert.Contains(t, actualLog, expectedLog, "Expected log message not found")
+
 }

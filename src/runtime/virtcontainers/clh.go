@@ -75,6 +75,9 @@ const (
 	clhTimeout                     = 10
 	clhAPITimeout                  = 1
 	clhAPITimeoutConfidentialGuest = 20
+	// Minimum timout for calling CreateVM followed by BootVM. Executing these two APIs
+	// might take longer than the value returned by getClhAPITimeout().
+	clhCreateAndBootVMMinimumTimeout = 10
 	// Timeout for hot-plug - hotplug devices can take more time, than usual API calls
 	// Use longer time timeout for it.
 	clhHotPlugAPITimeout                   = 5
@@ -510,8 +513,14 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 
 	// Create the VM memory config via the constructor to ensure default values are properly assigned
 	clh.vmconfig.Memory = chclient.NewMemoryConfig(int64((utils.MemUnit(clh.config.MemorySize) * utils.MiB).ToBytes()))
-	// shared memory should be enabled if using vhost-user(kata uses virtiofsd)
-	clh.vmconfig.Memory.Shared = func(b bool) *bool { return &b }(true)
+	// Memory config shared is to be enabled when using vhost_user backends, ex. virtio-fs
+	// or when using HugePages.
+	// If such features are disabled, turn off shared memory config.
+	if clh.config.SharedFS == config.NoSharedFS && !clh.config.HugePages {
+		clh.vmconfig.Memory.Shared = func(b bool) *bool { return &b }(false)
+	} else {
+		clh.vmconfig.Memory.Shared = func(b bool) *bool { return &b }(true)
+	}
 	// Enable hugepages if needed
 	clh.vmconfig.Memory.Hugepages = func(b bool) *bool { return &b }(clh.config.HugePages)
 	if !clh.config.ConfidentialGuest {
@@ -522,7 +531,7 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 	// Set initial amount of cpu's for the virtual machine
 	clh.vmconfig.Cpus = chclient.NewCpusConfig(int32(clh.config.NumVCPUs()), int32(clh.config.DefaultMaxVCPUs))
 
-	params, err := GetKernelRootParams(hypervisorConfig.RootfsType, clh.config.ConfidentialGuest, false)
+	params, err := GetKernelRootParams(hypervisorConfig.RootfsType, clh.config.ConfidentialGuest, !clh.config.ConfidentialGuest)
 	if err != nil {
 		return err
 	}
@@ -705,13 +714,16 @@ func (clh *cloudHypervisor) StartVM(ctx context.Context, timeout int) error {
 		}
 	}()
 
-	pid, err := clh.launchClh()
+	err = clh.launchClh()
 	if err != nil {
 		return fmt.Errorf("failed to launch cloud-hypervisor: %q", err)
 	}
-	clh.state.PID = pid
 
-	ctx, cancel := context.WithTimeout(ctx, clh.getClhAPITimeout()*time.Second)
+	bootTimeout := clh.getClhAPITimeout()
+	if bootTimeout < clhCreateAndBootVMMinimumTimeout {
+		bootTimeout = clhCreateAndBootVMMinimumTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, bootTimeout*time.Second)
 	defer cancel()
 
 	if err := clh.bootVM(ctx); err != nil {
@@ -1036,11 +1048,14 @@ func (clh *cloudHypervisor) ResizeMemory(ctx context.Context, reqMemMB uint32, m
 		newMem = alignedRequest
 	}
 
-	// Check if memory is the same as requested, a second Check is done
-	// to consider the memory request now that is updated to be memory aligned
+	// Post-alignment checks
 	if currentMem == newMem {
 		clh.Logger().WithFields(log.Fields{"current-memory": currentMem, "new-memory": newMem}).Debug("VM already has requested memory(after alignment)")
 		return uint32(currentMem.ToMiB()), MemoryDevice{}, nil
+	}
+	// Check for aligned memory exceeding max hotplug size
+	if newMem > (utils.MemUnit(uint32(maxHotplugSize.ToMiB())) * utils.MiB) {
+		newMem = utils.MemUnit(uint32(maxHotplugSize.ToMiB())) * utils.MiB
 	}
 
 	cl := clh.client()
@@ -1337,22 +1352,23 @@ func (clh *cloudHypervisor) clhPath() (string, error) {
 	return p, err
 }
 
-func (clh *cloudHypervisor) launchClh() (int, error) {
+func (clh *cloudHypervisor) launchClh() error {
+
+	clh.state.PID = -1
 
 	clhPath, err := clh.clhPath()
 	if err != nil {
-		return -1, err
+		return err
 	}
 
 	args := []string{cscAPIsocket, clh.state.apiSocket}
-	if clh.config.Debug {
+	if clh.config.Debug && clh.config.HypervisorLoglevel > 0 {
 		// Cloud hypervisor log levels
 		// 'v' occurrences increase the level
-		//0 =>  Error
-		//1 =>  Warn
-		//2 =>  Info
-		//3 =>  Debug
-		//4+ => Trace
+		//0 =>  Warn
+		//1 =>  Info
+		//2 =>  Debug
+		//3+ => Trace
 		// Use Info, the CI runs with debug enabled
 		// a high level of logging increases the boot time
 		// and in a nested environment this could increase
@@ -1366,7 +1382,8 @@ func (clh *cloudHypervisor) launchClh() (int, error) {
 		// output. For further details, see the discussion on:
 		//
 		//   https://github.com/kata-containers/kata-containers/pull/2751
-		args = append(args, "-v")
+		verbosityString := fmt.Sprintf("-%s", strings.Repeat("v", int(clh.config.HypervisorLoglevel)))
+		args = append(args, verbosityString)
 	}
 
 	// Enable the `seccomp` feature from Cloud Hypervisor by default
@@ -1399,15 +1416,17 @@ func (clh *cloudHypervisor) launchClh() (int, error) {
 
 	err = utils.StartCmd(cmdHypervisor)
 	if err != nil {
-		return -1, err
+		return err
 	}
+
+	clh.state.PID = cmdHypervisor.Process.Pid
 
 	if err := clh.waitVMM(clhTimeout); err != nil {
 		clh.Logger().WithError(err).Warn("cloud-hypervisor init failed")
-		return -1, err
+		return err
 	}
 
-	return cmdHypervisor.Process.Pid, nil
+	return nil
 }
 
 //###########################################################################
@@ -1457,7 +1476,12 @@ func (clh *cloudHypervisor) isClhRunning(timeout uint) (bool, error) {
 	timeStart := time.Now()
 	cl := clh.client()
 	for {
-		err := syscall.Kill(pid, syscall.Signal(0))
+		waitedPid, err := syscall.Wait4(pid, nil, syscall.WNOHANG, nil)
+		if waitedPid == pid && err == nil {
+			return false, nil
+		}
+
+		err = syscall.Kill(pid, syscall.Signal(0))
 		if err != nil {
 			return false, nil
 		}
@@ -1610,7 +1634,7 @@ func (clh *cloudHypervisor) getDiskRateLimiterConfig() *chclient.RateLimiterConf
 }
 
 func (clh *cloudHypervisor) addNet(e Endpoint) error {
-	clh.Logger().WithField("endpoint-type", e).Debugf("Adding Endpoint of type %v", e)
+	clh.Logger().WithField("endpoint", e).Debugf("Adding Endpoint of type %v", e.Type())
 
 	mac := e.HardwareAddr()
 	netPair := e.NetworkPair()

@@ -38,6 +38,7 @@ const (
 	DirectVolumeStatUrl   = "/direct-volume/stats"
 	DirectVolumeResizeUrl = "/direct-volume/resize"
 	IPTablesUrl           = "/iptables"
+	PolicyUrl             = "/policy"
 	IP6TablesUrl          = "/ip6tables"
 	MetricsUrl            = "/metrics"
 )
@@ -199,6 +200,32 @@ func (s *service) serveVolumeResize(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(""))
 }
 
+func (s *service) policyHandler(w http.ResponseWriter, r *http.Request) {
+	logger := shimMgtLog.WithFields(logrus.Fields{"handler": "policy"})
+
+	switch r.Method {
+	case http.MethodPut:
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			logger.WithError(err).Error("failed to read request body")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(err.Error()))
+			return
+		}
+
+		if err = s.sandbox.SetPolicy(context.Background(), string(body)); err != nil {
+			logger.WithError(err).Error("failed to set policy")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(err.Error()))
+		}
+		w.Write([]byte(""))
+
+	default:
+		w.WriteHeader(http.StatusNotImplemented)
+		return
+	}
+}
+
 func (s *service) ip6TablesHandler(w http.ResponseWriter, r *http.Request) {
 	s.genericIPTablesHandler(w, r, true)
 }
@@ -266,6 +293,7 @@ func (s *service) startManagementServer(ctx context.Context, ociSpec *specs.Spec
 	m.Handle(DirectVolumeStatUrl, http.HandlerFunc(s.serveVolumeStats))
 	m.Handle(DirectVolumeResizeUrl, http.HandlerFunc(s.serveVolumeResize))
 	m.Handle(IPTablesUrl, http.HandlerFunc(s.ipTablesHandler))
+	m.Handle(PolicyUrl, http.HandlerFunc(s.policyHandler))
 	m.Handle(IP6TablesUrl, http.HandlerFunc(s.ip6TablesHandler))
 	s.mountPprofHandle(m, ociSpec)
 
@@ -338,12 +366,16 @@ func ServerSocketAddress(id string) string {
 // shim management endpoint
 // NOTE: this code allows various go clients, e.g. kata-runtime or kata-monitor commands, to
 // connect to the rust shim management implementation.
-func ClientSocketAddress(id string) string {
+func ClientSocketAddress(id string) (string, error) {
 	// get the go runtime uds path
 	socketPath := SocketPathGo(id)
 	// if the path not exist, use the rust runtime uds path instead
 	if _, err := os.Stat(socketPath); err != nil {
 		socketPath = SocketPathRust(id)
+		if _, err := os.Stat(socketPath); err != nil {
+			return "", fmt.Errorf("It fails to stat both %s and %s with error %v.", SocketPathGo(id), SocketPathRust(id), err)
+		}
 	}
-	return fmt.Sprintf("unix://%s", socketPath)
+
+	return fmt.Sprintf("unix://%s", socketPath), nil
 }
